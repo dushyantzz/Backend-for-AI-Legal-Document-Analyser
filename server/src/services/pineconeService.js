@@ -19,6 +19,8 @@ class PineconeService {
     this.index = null;
     this.indexName = process.env.PINECONE_INDEX_NAME || 'legal-documents';
     this.dimension = 768; // Gemini embedding dimensions
+    this.cloud = process.env.PINECONE_CLOUD || 'aws';
+    this.region = process.env.PINECONE_REGION || 'us-east-1';
     this.initialized = false;
   }
 
@@ -31,9 +33,12 @@ class PineconeService {
         throw new Error('PINECONE_API_KEY environment variable is required');
       }
 
+      // Initialize Pinecone client
       this.pinecone = new Pinecone({
         apiKey: process.env.PINECONE_API_KEY
       });
+
+      logger.info(`Initializing Pinecone with cloud: ${this.cloud}, region: ${this.region}`);
 
       // Check if index exists, create if not
       await this.ensureIndexExists();
@@ -41,10 +46,10 @@ class PineconeService {
       this.index = this.pinecone.index(this.indexName);
       this.initialized = true;
       
-      logger.info(`Pinecone service initialized with index: ${this.indexName}`);
+      logger.info(`✅ Pinecone service initialized with index: ${this.indexName} on ${this.cloud}/${this.region}`);
       return true;
     } catch (error) {
-      logger.error('Failed to initialize Pinecone service:', error);
+      logger.error('❌ Failed to initialize Pinecone service:', error);
       this.initialized = false;
       throw error;
     }
@@ -61,26 +66,56 @@ class PineconeService {
       );
 
       if (!indexExists) {
-        logger.info(`Creating new Pinecone index: ${this.indexName}`);
-        await this.pinecone.createIndex({
+        logger.info(`Creating new Pinecone index: ${this.indexName} on ${this.cloud}/${this.region}`);
+        
+        const indexConfig = {
           name: this.indexName,
           dimension: this.dimension,
           metric: 'cosine',
-          spec: {
+          spec: {}
+        };
+
+        // Configure based on cloud provider
+        if (this.cloud === 'aws') {
+          indexConfig.spec = {
+            serverless: {
+              cloud: 'aws',
+              region: this.region
+            }
+          };
+        } else if (this.cloud === 'gcp') {
+          indexConfig.spec = {
+            serverless: {
+              cloud: 'gcp',
+              region: this.region
+            }
+          };
+        } else if (this.cloud === 'azure') {
+          indexConfig.spec = {
+            serverless: {
+              cloud: 'azure',
+              region: this.region
+            }
+          };
+        } else {
+          // Default to AWS
+          indexConfig.spec = {
             serverless: {
               cloud: 'aws',
               region: 'us-east-1'
             }
-          }
-        });
+          };
+        }
+
+        await this.pinecone.createIndex(indexConfig);
         
         // Wait for index to be ready
         await this.waitForIndexReady();
       } else {
-        logger.info(`Index ${this.indexName} already exists`);
+        logger.info(`✅ Index ${this.indexName} already exists`);
       }
     } catch (error) {
-      logger.error('Error ensuring index exists:', error);
+      logger.error('❌ Error ensuring index exists:', error);
       throw error;
     }
   }
@@ -92,21 +127,26 @@ class PineconeService {
     let retries = 0;
     const maxRetries = 60; // Increased for serverless
     
+    logger.info(`⏳ Waiting for index ${this.indexName} to be ready...`);
+    
     while (retries < maxRetries) {
       try {
+        await new Promise(resolve => setTimeout(resolve, 3000)); // Wait 3 seconds
+        
         const indexStats = await this.index.describeIndexStats();
         if (indexStats) {
-          logger.info(`Index ${this.indexName} is ready`);
+          logger.info(`✅ Index ${this.indexName} is ready!`);
           return;
         }
       } catch (error) {
-        logger.info(`Waiting for index to be ready... (${retries + 1}/${maxRetries})`);
-        await new Promise(resolve => setTimeout(resolve, 3000)); // Wait 3 seconds
         retries++;
+        if (retries % 10 === 0) { // Log every 30 seconds
+          logger.info(`⏳ Still waiting for index to be ready... (${retries}/${maxRetries})`);
+        }
       }
     }
     
-    logger.warn(`Index ${this.indexName} may not be fully ready after ${maxRetries} retries, proceeding anyway`);
+    logger.warn(`⚠️ Index ${this.indexName} may not be fully ready after ${maxRetries} retries, proceeding anyway`);
   }
 
   /**
@@ -141,7 +181,7 @@ class PineconeService {
         throw new Error('No chunks provided for vectorization');
       }
 
-      logger.info(`Storing ${chunks.length} vectors for document ${documentId}`);
+      logger.info(`📝 Storing ${chunks.length} vectors for document ${documentId}`);
 
       const vectors = chunks.map((chunk, index) => {
         const embedding = embeddings[index];
@@ -152,13 +192,16 @@ class PineconeService {
         }
 
         return {
-          id: `${documentId}_chunk_${index}_${uuidv4()}`,
+          id: `${documentId}_chunk_${index}_${uuidv4().substring(0, 8)}`,
           values: embedding,
           metadata: {
             documentId,
             chunkIndex: index,
             text: chunk.substring(0, 40000), // Pinecone metadata size limit
             chunkLength: chunk.length,
+            filename: metadata.filename || 'unknown',
+            documentType: metadata.documentType || 'document',
+            userId: metadata.userId || 'anonymous',
             ...metadata,
             timestamp: new Date().toISOString()
           }
@@ -175,19 +218,19 @@ class PineconeService {
         try {
           await this.index.upsert(batch);
           storedCount += batch.length;
-          logger.info(`Stored batch ${Math.floor(i / batchSize) + 1} of ${Math.ceil(vectors.length / batchSize)} (${storedCount}/${vectors.length} vectors) for document ${documentId}`);
+          logger.info(`📦 Stored batch ${Math.floor(i / batchSize) + 1}/${Math.ceil(vectors.length / batchSize)} (${storedCount}/${vectors.length} vectors)`);
           
           // Small delay between batches
           if (i + batchSize < vectors.length) {
             await new Promise(resolve => setTimeout(resolve, 100));
           }
         } catch (batchError) {
-          logger.error(`Failed to store batch ${Math.floor(i / batchSize) + 1}:`, batchError);
+          logger.error(`❌ Failed to store batch ${Math.floor(i / batchSize) + 1}:`, batchError);
           throw batchError;
         }
       }
 
-      logger.info(`Successfully stored ${storedCount} vectors for document ${documentId}`);
+      logger.info(`✅ Successfully stored ${storedCount} vectors for document ${documentId}`);
       return {
         success: true,
         vectorCount: storedCount,
@@ -195,7 +238,7 @@ class PineconeService {
         batchesProcessed: Math.ceil(vectors.length / batchSize)
       };
     } catch (error) {
-      logger.error('Error storing document vectors:', error);
+      logger.error('❌ Error storing document vectors:', error);
       throw error;
     }
   }
@@ -246,12 +289,12 @@ class PineconeService {
         queryRequest.filter = queryFilter;
       }
 
-      logger.info(`Searching for similar chunks with topK=${topK}, minScore=${minScore}`);
+      logger.info(`🔍 Searching for similar chunks with topK=${topK}, minScore=${minScore}`);
       
       const searchResults = await this.index.query(queryRequest);
       
       if (!searchResults.matches) {
-        logger.warn('No matches returned from Pinecone query');
+        logger.warn('⚠️ No matches returned from Pinecone query');
         return {
           matches: [],
           totalResults: 0,
@@ -264,7 +307,7 @@ class PineconeService {
         match => match.score >= minScore
       );
 
-      logger.info(`Found ${searchResults.matches.length} total matches, ${filteredResults.length} above threshold ${minScore}`);
+      logger.info(`🎯 Found ${searchResults.matches.length} total matches, ${filteredResults.length} above threshold ${minScore}`);
       
       return {
         matches: filteredResults,
@@ -272,7 +315,7 @@ class PineconeService {
         filteredResults: filteredResults.length
       };
     } catch (error) {
-      logger.error('Error searching similar chunks:', error);
+      logger.error('❌ Error searching similar chunks:', error);
       throw error;
     }
   }
@@ -288,7 +331,7 @@ class PineconeService {
         throw new Error('Document ID is required');
       }
 
-      logger.info(`Deleting vectors for document ${documentId}`);
+      logger.info(`🗑️ Deleting vectors for document ${documentId}`);
       
       // Delete by metadata filter
       await this.index.deleteMany({
@@ -297,37 +340,10 @@ class PineconeService {
         }
       });
 
-      logger.info(`Deleted vectors for document ${documentId}`);
+      logger.info(`✅ Deleted vectors for document ${documentId}`);
       return { success: true, documentId };
     } catch (error) {
-      logger.error('Error deleting document vectors:', error);
-      throw error;
-    }
-  }
-
-  /**
-   * Delete vectors by user ID
-   */
-  async deleteUserVectors(userId) {
-    try {
-      this.ensureInitialized();
-
-      if (!userId) {
-        throw new Error('User ID is required');
-      }
-
-      logger.info(`Deleting vectors for user ${userId}`);
-      
-      await this.index.deleteMany({
-        filter: {
-          userId: { $eq: userId }
-        }
-      });
-
-      logger.info(`Deleted vectors for user ${userId}`);
-      return { success: true, userId };
-    } catch (error) {
-      logger.error('Error deleting user vectors:', error);
+      logger.error('❌ Error deleting document vectors:', error);
       throw error;
     }
   }
@@ -341,7 +357,7 @@ class PineconeService {
       const stats = await this.index.describeIndexStats();
       return stats;
     } catch (error) {
-      logger.error('Error getting index stats:', error);
+      logger.error('❌ Error getting index stats:', error);
       throw error;
     }
   }
@@ -385,33 +401,8 @@ class PineconeService {
 
       return Array.from(uniqueDocuments.values());
     } catch (error) {
-      logger.error('Error listing user documents:', error);
+      logger.error('❌ Error listing user documents:', error);
       throw error;
-    }
-  }
-
-  /**
-   * Get document chunk count
-   */
-  async getDocumentChunkCount(documentId) {
-    try {
-      this.ensureInitialized();
-
-      const stats = await this.getIndexStats();
-      
-      // This is an approximation since Pinecone doesn't provide exact counts by filter
-      // In production, you might want to store this in your database
-      return {
-        documentId,
-        estimatedChunkCount: stats.totalVectorCount || 0
-      };
-    } catch (error) {
-      logger.error('Error getting document chunk count:', error);
-      return {
-        documentId,
-        estimatedChunkCount: 0,
-        error: error.message
-      };
     }
   }
 
@@ -425,7 +416,9 @@ class PineconeService {
           status: 'unhealthy',
           error: 'Service not initialized',
           indexName: this.indexName,
-          dimension: this.dimension
+          dimension: this.dimension,
+          cloud: this.cloud,
+          region: this.region
         };
       }
 
@@ -435,6 +428,8 @@ class PineconeService {
         indexName: this.indexName,
         vectorCount: stats.totalVectorCount || 0,
         dimension: this.dimension,
+        cloud: this.cloud,
+        region: this.region,
         namespaces: stats.namespaces || {}
       };
     } catch (error) {
@@ -442,26 +437,10 @@ class PineconeService {
         status: 'unhealthy',
         error: error.message,
         indexName: this.indexName,
-        dimension: this.dimension
+        dimension: this.dimension,
+        cloud: this.cloud,
+        region: this.region
       };
-    }
-  }
-
-  /**
-   * Clear all vectors (use with caution)
-   */
-  async clearAllVectors() {
-    try {
-      this.ensureInitialized();
-      
-      logger.warn('Clearing all vectors from index');
-      await this.index.deleteAll();
-      
-      logger.info('All vectors cleared from index');
-      return { success: true };
-    } catch (error) {
-      logger.error('Error clearing all vectors:', error);
-      throw error;
     }
   }
 }
