@@ -17,7 +17,8 @@
     "ai",
     "rag",
     "vector-database",
-    "pinecone"
+    "pinecone",
+    "gemini"
   ],
   "author": "dushyantzz",
   "license": "MIT",
@@ -35,18 +36,15 @@
     "bcryptjs": "^2.4.3",
     "jsonwebtoken": "^9.0.2",
     "@pinecone-database/pinecone": "^1.1.2",
+    "@google/generative-ai": "^0.2.1",
     "openai": "^4.20.1",
-    "cohere-ai": "^7.7.5",
-    "langchain": "^0.0.208",
     "pdf-parse": "^1.1.1",
     "mammoth": "^1.6.0",
-    "node-nlp": "^4.27.0",
     "tiktoken": "^1.0.10",
     "uuid": "^9.0.1",
     "axios": "^1.6.2",
     "form-data": "^4.0.0",
     "express-fileupload": "^1.4.3",
-    "text-splitter": "^1.0.3",
     "compromise": "^14.10.0"
   },
   "devDependencies": {
