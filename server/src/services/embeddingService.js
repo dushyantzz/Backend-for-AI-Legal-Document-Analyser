@@ -1,5 +1,5 @@
+import { GoogleGenerativeAI } from '@google/generative-ai';
 import OpenAI from 'openai';
-import { CohereClient } from 'cohere-ai';
 import winston from 'winston';
 
 const logger = winston.createLogger({
@@ -15,10 +15,10 @@ const logger = winston.createLogger({
 
 class EmbeddingService {
   constructor() {
+    this.gemini = null;
     this.openai = null;
-    this.cohere = null;
-    this.defaultModel = process.env.EMBEDDING_MODEL || 'text-embedding-3-small';
-    this.dimensions = parseInt(process.env.EMBEDDING_DIMENSIONS) || 1536;
+    this.defaultProvider = 'gemini';
+    this.dimensions = 768; // Gemini embedding dimensions
     this.initializeClients();
   }
 
@@ -27,6 +27,14 @@ class EmbeddingService {
    */
   initializeClients() {
     try {
+      // Initialize Gemini
+      if (process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY) {
+        const apiKey = process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY;
+        this.gemini = new GoogleGenerativeAI(apiKey);
+        logger.info('Gemini client initialized for embeddings');
+      }
+
+      // Initialize OpenAI as fallback
       if (process.env.OPENAI_API_KEY) {
         this.openai = new OpenAI({
           apiKey: process.env.OPENAI_API_KEY
@@ -34,14 +42,7 @@ class EmbeddingService {
         logger.info('OpenAI client initialized for embeddings');
       }
 
-      if (process.env.COHERE_API_KEY) {
-        this.cohere = new CohereClient({
-          apiKey: process.env.COHERE_API_KEY
-        });
-        logger.info('Cohere client initialized for embeddings');
-      }
-
-      if (!this.openai && !this.cohere) {
+      if (!this.gemini && !this.openai) {
         throw new Error('No embedding service API keys provided');
       }
     } catch (error) {
@@ -51,9 +52,28 @@ class EmbeddingService {
   }
 
   /**
+   * Generate embeddings using Gemini
+   */
+  async generateGeminiEmbedding(text) {
+    try {
+      if (!this.gemini) {
+        throw new Error('Gemini client not initialized');
+      }
+
+      const model = this.gemini.getGenerativeModel({ model: 'embedding-001' });
+      const result = await model.embedContent(text);
+      
+      return result.embedding.values;
+    } catch (error) {
+      logger.error('Error generating Gemini embedding:', error);
+      throw error;
+    }
+  }
+
+  /**
    * Generate embeddings using OpenAI
    */
-  async generateOpenAIEmbedding(text, model = this.defaultModel) {
+  async generateOpenAIEmbedding(text, model = 'text-embedding-3-small') {
     try {
       if (!this.openai) {
         throw new Error('OpenAI client not initialized');
@@ -62,7 +82,7 @@ class EmbeddingService {
       const response = await this.openai.embeddings.create({
         model: model,
         input: text,
-        dimensions: this.dimensions
+        dimensions: model === 'text-embedding-3-small' ? 1536 : 3072
       });
 
       return response.data[0].embedding;
@@ -73,23 +93,36 @@ class EmbeddingService {
   }
 
   /**
-   * Generate embeddings using Cohere
+   * Generate single embedding with preferred provider
    */
-  async generateCohereEmbedding(text, model = 'embed-english-v3.0') {
+  async generateEmbedding(text, provider = this.defaultProvider) {
     try {
-      if (!this.cohere) {
-        throw new Error('Cohere client not initialized');
+      if (!text || text.trim().length === 0) {
+        throw new Error('Text cannot be empty');
       }
 
-      const response = await this.cohere.embed({
-        texts: [text],
-        model: model,
-        inputType: 'search_document'
-      });
+      // Truncate text if too long (Gemini has limits)
+      const maxLength = 2048;
+      const truncatedText = text.length > maxLength ? text.substring(0, maxLength) : text;
 
-      return response.embeddings[0];
+      if (provider === 'gemini' && this.gemini) {
+        return await this.generateGeminiEmbedding(truncatedText);
+      } else if (provider === 'openai' && this.openai) {
+        return await this.generateOpenAIEmbedding(truncatedText);
+      } else {
+        // Fallback to available provider
+        if (this.gemini) {
+          logger.info('Falling back to Gemini for embedding');
+          return await this.generateGeminiEmbedding(truncatedText);
+        } else if (this.openai) {
+          logger.info('Falling back to OpenAI for embedding');
+          return await this.generateOpenAIEmbedding(truncatedText);
+        } else {
+          throw new Error('No embedding providers available');
+        }
+      }
     } catch (error) {
-      logger.error('Error generating Cohere embedding:', error);
+      logger.error('Error generating embedding:', error);
       throw error;
     }
   }
@@ -97,15 +130,16 @@ class EmbeddingService {
   /**
    * Generate embeddings for multiple texts in batch
    */
-  async generateBatchEmbeddings(texts, provider = 'openai', options = {}) {
+  async generateBatchEmbeddings(texts, provider = this.defaultProvider, options = {}) {
     try {
       const {
-        batchSize = 100,
-        model = this.defaultModel,
-        delay = 100
+        batchSize = 10, // Smaller batch size for Gemini
+        delay = 500 // Delay between batches
       } = options;
 
       const allEmbeddings = [];
+      
+      logger.info(`Generating embeddings for ${texts.length} texts using ${provider}`);
       
       // Process in batches to avoid rate limits
       for (let i = 0; i < texts.length; i += batchSize) {
@@ -113,15 +147,8 @@ class EmbeddingService {
         
         logger.info(`Processing embedding batch ${Math.floor(i / batchSize) + 1} of ${Math.ceil(texts.length / batchSize)}`);
         
-        let batchEmbeddings;
-        
-        if (provider === 'openai') {
-          batchEmbeddings = await this.processOpenAIBatch(batch, model);
-        } else if (provider === 'cohere') {
-          batchEmbeddings = await this.procesCohereBatch(batch, model);
-        } else {
-          throw new Error(`Unsupported embedding provider: ${provider}`);
-        }
+        const batchPromises = batch.map(text => this.generateEmbedding(text, provider));
+        const batchEmbeddings = await Promise.all(batchPromises);
         
         allEmbeddings.push(...batchEmbeddings);
         
@@ -140,69 +167,12 @@ class EmbeddingService {
   }
 
   /**
-   * Process OpenAI batch
-   */
-  async processOpenAIBatch(texts, model) {
-    try {
-      if (!this.openai) {
-        throw new Error('OpenAI client not initialized');
-      }
-
-      const response = await this.openai.embeddings.create({
-        model: model,
-        input: texts,
-        dimensions: this.dimensions
-      });
-
-      return response.data.map(item => item.embedding);
-    } catch (error) {
-      logger.error('Error processing OpenAI batch:', error);
-      throw error;
-    }
-  }
-
-  /**
-   * Process Cohere batch
-   */
-  async procesCohereBatch(texts, model = 'embed-english-v3.0') {
-    try {
-      if (!this.cohere) {
-        throw new Error('Cohere client not initialized');
-      }
-
-      const response = await this.cohere.embed({
-        texts: texts,
-        model: model,
-        inputType: 'search_document'
-      });
-
-      return response.embeddings;
-    } catch (error) {
-      logger.error('Error processing Cohere batch:', error);
-      throw error;
-    }
-  }
-
-  /**
    * Generate query embedding (optimized for search)
    */
-  async generateQueryEmbedding(query, provider = 'openai') {
+  async generateQueryEmbedding(query, provider = this.defaultProvider) {
     try {
       logger.info(`Generating query embedding using ${provider}`);
-      
-      if (provider === 'openai') {
-        return await this.generateOpenAIEmbedding(query);
-      } else if (provider === 'cohere') {
-        // For Cohere, use search_query input type for queries
-        const response = await this.cohere.embed({
-          texts: [query],
-          model: 'embed-english-v3.0',
-          inputType: 'search_query'
-        });
-        return response.embeddings[0];
-      } else {
-        throw new Error(`Unsupported embedding provider: ${provider}`);
-      }
+      return await this.generateEmbedding(query, provider);
     } catch (error) {
       logger.error('Error generating query embedding:', error);
       throw error;
@@ -238,23 +208,76 @@ class EmbeddingService {
       return dotProduct / (norm1 * norm2);
     } catch (error) {
       logger.error('Error calculating cosine similarity:', error);
-      throw error;
+      return 0;
     }
   }
 
   /**
-   * Get embedding dimensions for a given model
+   * Get embedding dimensions for current provider
    */
-  getEmbeddingDimensions(model = this.defaultModel) {
-    const dimensionMap = {
-      'text-embedding-3-small': 1536,
-      'text-embedding-3-large': 3072,
-      'text-embedding-ada-002': 1536,
-      'embed-english-v3.0': 1024,
-      'embed-multilingual-v3.0': 1024
-    };
+  getEmbeddingDimensions(provider = this.defaultProvider) {
+    if (provider === 'gemini') {
+      return 768;
+    } else if (provider === 'openai') {
+      return 1536; // for text-embedding-3-small
+    }
+    return this.dimensions;
+  }
 
-    return dimensionMap[model] || this.dimensions;
+  /**
+   * Validate embedding vector
+   */
+  validateEmbedding(embedding) {
+    if (!Array.isArray(embedding)) {
+      return false;
+    }
+    
+    if (embedding.length === 0) {
+      return false;
+    }
+    
+    // Check if all elements are numbers
+    return embedding.every(val => typeof val === 'number' && !isNaN(val));
+  }
+
+  /**
+   * Normalize embedding vector
+   */
+  normalizeEmbedding(embedding) {
+    try {
+      const norm = Math.sqrt(embedding.reduce((sum, val) => sum + val * val, 0));
+      if (norm === 0) {
+        return embedding;
+      }
+      return embedding.map(val => val / norm);
+    } catch (error) {
+      logger.error('Error normalizing embedding:', error);
+      return embedding;
+    }
+  }
+
+  /**
+   * Get available providers
+   */
+  getAvailableProviders() {
+    const providers = [];
+    if (this.gemini) providers.push('gemini');
+    if (this.openai) providers.push('openai');
+    return providers;
+  }
+
+  /**
+   * Switch default provider
+   */
+  setDefaultProvider(provider) {
+    const available = this.getAvailableProviders();
+    if (available.includes(provider)) {
+      this.defaultProvider = provider;
+      this.dimensions = this.getEmbeddingDimensions(provider);
+      logger.info(`Default embedding provider set to: ${provider}`);
+    } else {
+      throw new Error(`Provider ${provider} not available. Available: ${available.join(', ')}`);
+    }
   }
 
   /**
@@ -262,33 +285,55 @@ class EmbeddingService {
    */
   async healthCheck() {
     const health = {
+      gemini: false,
       openai: false,
-      cohere: false,
-      defaultModel: this.defaultModel,
-      dimensions: this.dimensions
+      defaultProvider: this.defaultProvider,
+      dimensions: this.dimensions,
+      availableProviders: []
     };
 
     try {
+      if (this.gemini) {
+        await this.generateGeminiEmbedding('test');
+        health.gemini = true;
+        health.availableProviders.push('gemini');
+      }
+    } catch (error) {
+      logger.warn('Gemini embedding health check failed:', error.message);
+    }
+
+    try {
       if (this.openai) {
-        // Test with a simple embedding
         await this.generateOpenAIEmbedding('test');
         health.openai = true;
+        health.availableProviders.push('openai');
       }
     } catch (error) {
       logger.warn('OpenAI embedding health check failed:', error.message);
     }
 
-    try {
-      if (this.cohere) {
-        // Test with a simple embedding
-        await this.generateCohereEmbedding('test');
-        health.cohere = true;
-      }
-    } catch (error) {
-      logger.warn('Cohere embedding health check failed:', error.message);
-    }
-
     return health;
+  }
+
+  /**
+   * Clear any cached embeddings (if caching is implemented)
+   */
+  clearCache() {
+    // Placeholder for future caching implementation
+    logger.info('Embedding cache cleared');
+  }
+
+  /**
+   * Get embedding statistics
+   */
+  getStats() {
+    return {
+      defaultProvider: this.defaultProvider,
+      dimensions: this.dimensions,
+      availableProviders: this.getAvailableProviders(),
+      geminiAvailable: !!this.gemini,
+      openaiAvailable: !!this.openai
+    };
   }
 }
 
