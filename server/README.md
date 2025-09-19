@@ -1,277 +1,92 @@
-# Legal Documentation Assistant - Backend
+# LexiPlain Backend
 
-A comprehensive backend system for legal document management, compliance tracking, and AI-powered assistance with multilingual support.
+A fully-fledged backend for the LexiPlain legal AI document analyzer, built with Node.js/Express and Google Cloud services (Vertex AI, Vision, Speech-to-Text, Text-to-Speech, Firestore, Cloud Storage). Includes OCR-based ingestion, AI/NLP analysis with clause detection and risk scoring, RAG-friendly structure, and a voice query interface.
 
-## Features
+## Prerequisites
+- Node.js >= 18
+- pnpm
+- Google Cloud project with the following APIs enabled:
+  - Vertex AI API
+  - Cloud Vision API
+  - Cloud Speech-to-Text API
+  - Cloud Text-to-Speech API
+  - Firestore (in Native mode)
+  - Cloud Storage
+- Service account JSON key with permissions for the above
 
-### Core Features
-- **User Authentication & Management**: JWT-based authentication with role-based access control
-- **Document Management**: Create, edit, and manage legal documents with versioning
-- **Template System**: Dynamic document templates with form generation
-- **Deadline Management**: Track and manage legal deadlines with recurring support
-- **Notification System**: Multi-channel notifications (Email, SMS, WhatsApp, Push)
-- **AI-Powered Chat**: Multilingual legal assistance with document suggestions
-- **Compliance Engine**: GST and legal compliance checking with automated deadline creation
-- **Multilingual Support**: Support for 12 Indian languages with translation services
-
-### Advanced Features
-- **Real-time Reminders**: Automated deadline reminders with customizable schedules
-- **Legal Corpus Search**: AI-powered search through legal knowledge base
-- **Compliance Rules Engine**: Customizable compliance rules and validation
-- **Background Tasks**: Celery-based task processing for notifications and document generation
-- **Admin Panel**: Template and user management for administrators
-- **API Documentation**: Comprehensive REST API with proper error handling
-
-## Technology Stack
-
-- **Backend**: Flask, SQLAlchemy, Flask-JWT-Extended
-- **Database**: PostgreSQL
-- **Task Queue**: Celery with Redis
-- **AI/ML**: Sentence Transformers, NLTK, Google Translate
-- **Notifications**: Twilio (SMS/WhatsApp), SMTP (Email)
-- **Authentication**: JWT tokens with refresh mechanism
-- **Validation**: Custom validators with Pydantic support
-
-## Installation
-
-### Prerequisites
-- Python 3.8+
-- PostgreSQL 12+
-- Redis 6+
-- Docker (optional, for containerized setup)
-
-### Setup Instructions
-
-1. **Clone the repository**
-   ```bash
-   git clone <repository-url>
-   cd Legal-Documentation-Assistant/server
-   ```
-
-2. **Create virtual environment**
-   ```bash
-   python -m venv venv
-   source venv/bin/activate  # On Windows: venv\Scripts\activate
-   ```
-
-3. **Install dependencies**
-   ```bash
-   pip install -r requirements.txt
-   ```
-
-4. **Set up environment variables**
-   ```bash
-   cp env.example .env
-   # Edit .env with your configuration
-   ```
-
-5. **Set up database**
-   ```bash
-   # Create PostgreSQL database
-   createdb docbuddy
-   
-   # Initialize database schema
-   python createdatabase.py
-   ```
-
-6. **Run database migrations**
-   ```bash
-   flask db init
-   flask db migrate -m "Initial migration"
-   flask db upgrade
-   ```
-
-7. **Start Redis server**
-   ```bash
-   redis-server
-   ```
-
-8. **Run the application**
-   ```bash
-   # Start main application
-   python run.py
-   
-   # In separate terminals, start Celery workers
-   python run_celery.py
-   python run_beat.py
-   ```
-
-## API Endpoints
-
-### Authentication
-- `POST /api/auth/register` - User registration
-- `POST /api/auth/login` - User login
-- `POST /api/auth/refresh` - Refresh JWT token
-- `GET /api/auth/profile` - Get user profile
-- `PUT /api/auth/profile` - Update user profile
-
-### Documents
-- `GET /api/documents` - Get user documents
-- `POST /api/documents` - Create document
-- `GET /api/documents/{id}` - Get specific document
-- `PUT /api/documents/{id}` - Update document
-- `DELETE /api/documents/{id}` - Delete document
-
-### Templates
-- `GET /api/templates` - Get available templates
-- `POST /api/admin/templates` - Create template (admin only)
-
-### Deadlines
-- `GET /api/deadlines` - Get user deadlines
-- `POST /api/deadlines` - Create deadline
-- `PUT /api/deadlines/{id}` - Update deadline
-- `DELETE /api/deadlines/{id}` - Delete deadline
-
-### AI Chat
-- `POST /api/chat` - Get AI chat response
-
-### Compliance
-- `POST /api/compliance/check` - Check compliance requirements
-
-### Notifications
-- `GET /api/notifications` - Get user notifications
-
-### Admin
-- `GET /api/admin/users` - Get all users (admin only)
-- `POST /api/admin/templates` - Create template (admin only)
-
-## Configuration
-
-### Environment Variables
-
-| Variable | Description | Default |
-|----------|-------------|---------|
-| `DATABASE_HOST` | PostgreSQL host | localhost |
-| `DATABASE_NAME` | Database name | docbuddy |
-| `DATABASE_USER` | Database user | postgres |
-| `PASSWORD` | Database password | postgres |
-| `DATABASE_PORT` | Database port | 5432 |
-| `SECRET_KEY` | Flask secret key | - |
-| `JWT_SECRET_KEY` | JWT secret key | - |
-| `REDIS_URL` | Redis connection URL | redis://localhost:6379/0 |
-| `MAIL_SERVER` | SMTP server | smtp.gmail.com |
-| `MAIL_USERNAME` | Email username | - |
-| `MAIL_PASSWORD` | Email password | - |
-| `TWILIO_ACCOUNT_SID` | Twilio account SID | - |
-| `TWILIO_AUTH_TOKEN` | Twilio auth token | - |
-| `TWILIO_PHONE_NUMBER` | Twilio phone number | - |
-
-### Database Schema
-
-The system uses the following main tables:
-- `users` - User accounts and profiles
-- `documents` - Legal documents
-- `templates` - Document templates
-- `deadlines` - Deadline tracking
-- `notifications` - Notification queue
-- `legal_corpus` - AI knowledge base
-- `compliance_rules` - Custom compliance rules
-
-## Development
-
-### Running Tests
+## Setup
+1. Copy env template and fill values
 ```bash
-python -m pytest tests/
+cp .env.example .env
 ```
 
-### Code Style
+2. Install dependencies
 ```bash
-black .
-flake8 .
+pnpm install
 ```
 
-### Database Migrations
+3. Run the server
 ```bash
-# Create migration
-flask db migrate -m "Description"
-
-# Apply migration
-flask db upgrade
+pnpm dev
 ```
+Server runs at http://localhost:3001
 
-## Deployment
+## API Overview
+Base URL: `/api`
 
-### Docker Deployment
-```bash
-# Build image
-docker build -t legal-doc-backend .
+- Documents
+  - POST `/documents/upload` — upload single document (field `document`)
+  - POST `/documents/batch-upload` — upload multiple documents (field `documents[]` up to 5)
+  - GET `/documents/:documentId/status` — processing status
+  - POST `/documents/:documentId/reprocess` — reprocess placeholder
+  - GET `/documents/supported-types` — supported formats and limits
+  - GET `/documents/demo-samples` — sample demo descriptors
 
-# Run container
-docker run -p 5000:5000 legal-doc-backend
-```
+- Analysis
+  - POST `/analysis/:documentId/analyze` — run analysis on extracted text
+  - GET `/analysis/:documentId` — fetch stored analysis
+  - POST `/analysis/:documentId/query` — ask a text question about the doc
+  - GET `/analysis/:documentId/clauses` — list/filter clauses
+  - GET `/analysis/:documentId/risks` — risk overview
+  - POST `/analysis/:documentId/plain-language` — plain-English for section/clause
+  - GET `/analysis/:documentId/export?format=json` — export results
 
-### Production Setup
-1. Set `FLASK_ENV=production`
-2. Use production database
-3. Configure proper email/SMS services
-4. Set up SSL certificates
-5. Use process manager (PM2, systemd)
-6. Set up monitoring and logging
+- Voice
+  - POST `/voice/:documentId/query` — upload `audio` and get spoken + text answer
+  - POST `/voice/transcribe` — STT only for `audio`
+  - POST `/voice/synthesize` — TTS from text
+  - GET `/voice/:sessionId/history` — conversation history
+  - DELETE `/voice/:sessionId/history` — clear history
+  - GET `/voice/capabilities` — supported languages/voices
+  - GET `/voice/stats` — system stats
 
-## API Documentation
+- Health
+  - GET `/health` — basic status
+  - GET `/health/detailed` — services diagnostics
+  - GET `/health/metrics` — runtime metrics
+  - GET `/health/readiness` — readiness probe
+  - GET `/health/liveness` — liveness probe
 
-### Authentication Flow
-1. Register user with `POST /api/auth/register`
-2. Login with `POST /api/auth/login` to get access token
-3. Use access token in `Authorization: Bearer <token>` header
-4. Refresh token with `POST /api/auth/refresh` when needed
+## Frontend Integration Notes
+- Dev CORS origin defaults to `http://localhost:8080` (Vite dev server)
+- Use Socket.IO events for live progress:
+  - `document:processing:start|complete|error`
+  - `document:batch:start|complete|error`
+  - `analysis:start|complete|error`
+  - `voice:processing:start|complete|error`
 
-### Error Handling
-All endpoints return consistent error responses:
-```json
-{
-  "error": "Error type",
-  "message": "Detailed error message"
-}
-```
-
-### Rate Limiting
-- 100 requests per hour per IP (configurable)
-- JWT token refresh limited to 5 times per hour
-
-## Monitoring
-
-### Health Check
-- `GET /api/health` - Application health status
-
-### Metrics
-- Request count and response times
-- Database connection pool status
-- Celery task queue status
-- Notification delivery rates
+## RAG Readiness
+- Analyses are stored in Firestore; add a vector DB later (e.g., Vertex Matching Engine) by storing embeddings from `textembedding-gecko`
+- `aiAnalyzer` produces clause summaries and plain language — ideal chunk boundaries
 
 ## Security
+- Rate limiting enabled
+- Helmet and CORS configured
+- Do not commit real secrets; use `.env`
 
-### Authentication
-- JWT tokens with configurable expiration
-- Refresh token mechanism
-- Password hashing with bcrypt
+## Deployment
+- Serverless: deploy pieces to Cloud Functions/Run using the included `@google-cloud/functions-framework`
+- Storage bucket required for original files
 
-### Authorization
-- Role-based access control (User, Admin, Lawyer)
-- Resource ownership validation
-- API endpoint protection
 
-### Data Protection
-- Input validation and sanitization
-- SQL injection prevention
-- XSS protection
-- CORS configuration
 
-## Contributing
-
-1. Fork the repository
-2. Create feature branch
-3. Make changes with tests
-4. Submit pull request
-
-## License
-
-MIT License - see LICENSE file for details
-
-## Support
-
-For support and questions:
-- Create an issue in the repository
-- Contact the development team
-- Check the documentation wiki
