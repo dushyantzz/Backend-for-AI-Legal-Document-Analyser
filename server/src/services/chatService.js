@@ -1,6 +1,7 @@
 import { v4 as uuidv4 } from "uuid";
 import winston from "winston";
 import databaseService from "./databaseService.js";
+import ragService from "./ragService.js";
 
 const logger = winston.createLogger({
   level: "info",
@@ -143,34 +144,53 @@ class ChatService {
     }
   }
 
-  // Generate AI response (placeholder for your model)
+  // Generate AI response using RAG service
   async generateResponse(documentId, message, sessionId) {
     try {
-      // This is where you'll integrate your AI model
-      // For now, return a placeholder response
-      const responses = [
-        "I understand you're asking about the document. Let me analyze that for you.",
-        "That's an interesting question about the legal document. Based on my analysis...",
-        "I can help you understand that part of the document. Here's what I found...",
-        "Let me look into that specific clause for you.",
-        "I've reviewed the document and can provide insights on that topic.",
-      ];
+      logger.info(`Generating RAG response for document: ${documentId}, message: ${message.substring(0, 100)}...`);
+      
+      // Use RAG service to query the document
+      const ragResponse = await ragService.queryDocuments(message, {
+        documentId: documentId,
+        maxResults: 5,
+        minSimilarity: 0.7
+      });
 
-      const randomResponse =
-        responses[Math.floor(Math.random() * responses.length)];
+      let response;
+      let confidence = 0.5;
+      let sources = [];
+      
+      if (ragResponse && ragResponse.sources && ragResponse.sources.length > 0) {
+        // Use the RAG response
+        response = ragResponse.response;
+        confidence = ragResponse.confidence || 0.8;
+        sources = ragResponse.sources.map(source => ({
+          content: source.content.substring(0, 200) + '...',
+          similarity: source.similarity
+        }));
+        
+        logger.info(`RAG response generated with ${ragResponse.sources.length} sources, confidence: ${confidence}`);
+      } else {
+        // Fallback response if no relevant content found
+        response = "I couldn't find specific information about your question in the uploaded document. Could you please rephrase your question or ask about a different aspect of the document?";
+        confidence = 0.3;
+        sources = [];
+        
+        logger.warn(`No relevant content found for query: ${message}`);
+      }
 
       // Save the AI response
       await this.sendMessage(
         sessionId,
         documentId,
-        randomResponse,
+        response,
         "assistant",
       );
 
       return {
-        response: randomResponse,
-        confidence: 0.85,
-        sources: ["document analysis"],
+        response: response,
+        confidence: confidence,
+        sources: sources,
         suggestions: [
           "Can you explain this in simpler terms?",
           "What are the key points I should know?",
@@ -179,7 +199,17 @@ class ChatService {
       };
     } catch (error) {
       logger.error("Failed to generate response:", error);
-      throw error;
+      
+      // Fallback response on error
+      const fallbackResponse = "I'm having trouble processing your question right now. Please try again in a moment.";
+      await this.sendMessage(sessionId, documentId, fallbackResponse, "assistant");
+      
+      return {
+        response: fallbackResponse,
+        confidence: 0.1,
+        sources: [],
+        suggestions: ["Try rephrasing your question", "Ask about a different topic"],
+      };
     }
   }
 

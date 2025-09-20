@@ -1,6 +1,5 @@
 # Dependencies
-node_modules/
-*/node_modules/
+
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
@@ -94,6 +93,8 @@ public
 tmp/
 temp/
 
+node_modules/
+
 # Logs
 logs
 *.log
@@ -131,11 +132,7 @@ dist/
 out/
 
 # Server specific
-server/logs/
-server/data/
-server/uploads/
-server/.env
-server/keys/
+
 
 # Client specific
 client/dist/

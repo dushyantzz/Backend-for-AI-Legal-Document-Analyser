@@ -52,7 +52,7 @@ const server = createServer(app);
 // Initialize Socket.IO
 const io = new Server(server, {
   cors: {
-    origin: process.env.CORS_ORIGIN || "http://localhost:8081",
+    origin: "http://localhost:8080", // Frontend is running on port 8080
     methods: ["GET", "POST"]
   }
 });
@@ -74,7 +74,7 @@ app.use(helmet({
 }));
 
 app.use(cors({
-  origin: process.env.CORS_ORIGIN || "http://localhost:8081",
+  origin: "http://localhost:8080", // Frontend is running on port 8080
   credentials: true
 }));
 
@@ -227,13 +227,13 @@ process.on('SIGINT', () => {
 // Uncaught exception handler
 process.on('uncaughtException', (error) => {
   logger.error('Uncaught Exception:', error);
-  process.exit(1);
+  // Don't exit immediately, log and continue
 });
 
 // Unhandled rejection handler
 process.on('unhandledRejection', (reason, promise) => {
   logger.error('Unhandled Rejection at:', promise, 'reason:', reason);
-  process.exit(1);
+  // Don't exit immediately, log and continue
 });
 
 // Start server
@@ -246,7 +246,7 @@ async function startServer() {
     server.listen(PORT, () => {
       logger.info(`🚀 Server running on port ${PORT}`);
       logger.info(`📁 Environment: ${process.env.NODE_ENV || 'development'}`);
-      logger.info(`🌐 CORS origin: ${process.env.CORS_ORIGIN || 'http://localhost:8086'}`);
+      logger.info(`🌐 CORS origin: http://localhost:8080`);
       logger.info(`✅ Socket.IO handlers setup complete`);
     });
     

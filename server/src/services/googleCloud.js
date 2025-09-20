@@ -97,7 +97,7 @@ async function testConnections() {
 }
 
 // Vertex AI - Gemini Model
-export async function getVertexAIModel(modelName = "gemini-1.5-pro") {
+export async function getVertexAIModel(modelName = "gemini-1.5-flash") {
   if (!vertexAI) {
     throw new Error("Vertex AI not initialized");
   }

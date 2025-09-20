@@ -178,7 +178,7 @@ export async function analyzeDocument(documentText, options = {}) {
       confidence: calculateConfidence(clauses, riskAssessment),
       metadata: {
         analysisVersion: "2.0",
-        model: "gemini-1.5-pro",
+        model: "gemini-1.5-flash",
         timestamp: new Date().toISOString(),
       },
     };

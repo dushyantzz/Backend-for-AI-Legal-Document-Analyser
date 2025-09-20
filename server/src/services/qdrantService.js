@@ -36,31 +36,46 @@ class QdrantService {
       return;
     }
 
-    try {
-      logger.info('Connecting to Qdrant...');
-      
-      this.client = new QdrantClient({
-        url: url,
-        apiKey: apiKey,
-        checkCompatibility: false // Skip version check for cloud instances
-      });
+    // Retry connection logic
+    const maxRetries = 3;
+    let retryCount = 0;
 
-      // Test connection by getting collections info
-      await this.client.getCollections();
-      
-      logger.info(`✅ Qdrant connected successfully`);
-    } catch (error) {
-      logger.error('Qdrant connection failed:', {
-        message: error.message,
-        url: url,
-        apiKeyPresent: !!apiKey,
-        collectionName: this.collectionName,
-        errorType: error.constructor.name
-      });
-      
-      logger.warn('⚠️  Qdrant unavailable - RAG features will use local storage only');
-      this.initialized = false;
-      // Don't throw error - allow server to continue without Qdrant
+    while (retryCount < maxRetries) {
+      try {
+        logger.info(`Connecting to Qdrant... (attempt ${retryCount + 1}/${maxRetries})`);
+        
+        this.client = new QdrantClient({
+          url: url,
+          apiKey: apiKey,
+          checkCompatibility: false, // Skip version check for cloud instances
+          timeout: 15000 // Increased timeout
+        });
+
+        // Test connection by getting collections info
+        await this.client.getCollections();
+        
+        this.initialized = true;
+        logger.info(`✅ Qdrant connected successfully`);
+        break;
+      } catch (error) {
+        retryCount++;
+        logger.error(`Qdrant connection failed (attempt ${retryCount}/${maxRetries}):`, {
+          message: error.message,
+          url: url,
+          apiKeyPresent: !!apiKey,
+          collectionName: this.collectionName,
+          errorType: error.constructor.name
+        });
+        
+        if (retryCount >= maxRetries) {
+          logger.warn('⚠️  Qdrant unavailable after all retry attempts - RAG features will use local storage only');
+          this.initialized = false;
+          break;
+        } else {
+          logger.info(`Retrying Qdrant connection in 2 seconds...`);
+          await new Promise(resolve => setTimeout(resolve, 2000));
+        }
+      }
     }
   }
 
@@ -105,35 +120,70 @@ class QdrantService {
     try {
       const { id, vector, metadata } = vectorData;
       
-      await this.client.upsert(this.collectionName, {
+      // Convert string ID to integer for Qdrant
+      const numericId = Math.abs(id.split('').reduce((a, b) => {
+        a = ((a << 5) - a) + b.charCodeAt(0);
+        return a & a;
+      }, 0));
+      
+      // Add timeout to prevent hanging
+      const upsertPromise = this.client.upsert(this.collectionName, {
         wait: true,
         points: [{
-          id: id,
+          id: numericId,
           vector: vector,
           payload: metadata
         }]
       });
+      
+      const timeoutPromise = new Promise((_, reject) => 
+        setTimeout(() => reject(new Error('Upsert timeout')), 15000)
+      );
+      
+      await Promise.race([upsertPromise, timeoutPromise]);
 
       logger.debug(`Vector upserted: ${id}`);
       return true;
     } catch (error) {
-      logger.error('Failed to upsert vector:', error.message);
+      logger.error('Failed to upsert vector:', {
+        message: error.message,
+        vectorLength: vectorData.vector ? vectorData.vector.length : 'undefined',
+        id: vectorData.id,
+        collectionName: this.collectionName
+      });
       return false;
     }
   }
 
-  async searchSimilarVectors(queryVector, limit = 5, scoreThreshold = 0.7) {
+  async searchSimilarVectors(queryVector, limit = 5, scoreThreshold = 0.7, filter = null) {
     if (!this.isAvailable()) {
+      logger.warn('Qdrant not available for search');
       return [];
     }
 
     try {
-      const searchResult = await this.client.search(this.collectionName, {
+      logger.debug(`Searching Qdrant with vector length: ${queryVector.length}, limit: ${limit}, threshold: ${scoreThreshold}, filter:`, filter);
+      
+      const searchOptions = {
         vector: queryVector,
         limit: limit,
         with_payload: true,
         score_threshold: scoreThreshold
-      });
+      };
+
+      if (filter) {
+        searchOptions.filter = filter;
+      }
+      
+      // Add timeout to prevent hanging
+      const searchPromise = this.client.search(this.collectionName, searchOptions);
+      const timeoutPromise = new Promise((_, reject) => 
+        setTimeout(() => reject(new Error('Search timeout')), 10000)
+      );
+      
+      const searchResult = await Promise.race([searchPromise, timeoutPromise]);
+      
+      logger.debug(`Qdrant search returned ${searchResult.length} results`);
 
       return searchResult.map(result => ({
         id: result.id,

@@ -85,6 +85,10 @@ class DatabaseService {
     );
   }
 
+  async getDocumentById(documentId) {
+    return this.documents.get(documentId) || null;
+  }
+
   async deleteDocument(documentId) {
     this.documents.delete(documentId);
     // Also delete related sessions and messages

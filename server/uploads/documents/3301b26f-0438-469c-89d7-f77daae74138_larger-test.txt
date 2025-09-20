@@ -1,0 +1,1 @@
+This is a larger test document for upload testing. It contains more text to ensure proper chunking and vectorization. This document should be processed successfully by the RAG system and stored in the Qdrant vector database for question answering functionality.

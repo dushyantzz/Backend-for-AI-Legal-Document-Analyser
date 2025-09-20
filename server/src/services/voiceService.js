@@ -5,6 +5,7 @@ import {
   getVertexAIModel 
 } from './googleCloud.js';
 import { analyzeDocument } from './aiAnalyzer.js';
+import ragService from './ragService.js';
 
 const logger = winston.createLogger({
   level: 'info',
@@ -78,7 +79,7 @@ export class VoiceQuerySystem {
         suggestions: this.generateFollowUpQuestions(transcription.transcript, documentId),
         processingTime: Date.now() - startTime,
         metadata: {
-          model: 'gemini-1.5-pro',
+          model: 'gemini-1.5-flash',
           timestamp: new Date().toISOString()
         }
       };
@@ -116,15 +117,22 @@ export class VoiceQuerySystem {
     }
   }
 
-  // Process text query against document context
+  // Process text query against document context using RAG
   async processTextQuery(queryText, documentId, sessionId, options = {}) {
     try {
-      // Get document context
-      const documentContext = this.getDocumentContext(documentId);
-      if (!documentContext) {
+      logger.info(`Processing text query with RAG: "${queryText}" for document: ${documentId}`);
+
+      // Use RAG service to query the document
+      const ragResponse = await ragService.queryDocuments(queryText, {
+        documentId: documentId,
+        maxResults: 5,
+        minSimilarity: 0.7
+      });
+
+      if (!ragResponse || !ragResponse.sources || ragResponse.sources.length === 0) {
         return {
-          answer: "I don't have access to that document. Please upload a document first.",
-          confidence: 0.0,
+          answer: ragResponse?.response || "I couldn't find relevant information in the document to answer your question. Please try rephrasing your question or ask about a different topic.",
+          confidence: ragResponse?.confidence || 0.0,
           sources: [],
           relatedClauses: []
         };
@@ -133,10 +141,10 @@ export class VoiceQuerySystem {
       // Get conversation history for context
       const conversationHistory = this.getConversationHistory(sessionId);
 
-      // Generate contextual response using AI
-      const response = await this.generateContextualResponse(
+      // Generate contextual response using AI with RAG results
+      const response = await this.generateContextualResponseWithRAG(
         queryText, 
-        documentContext, 
+        ragResponse.sources, 
         conversationHistory,
         options
       );
@@ -144,6 +152,46 @@ export class VoiceQuerySystem {
       return response;
     } catch (error) {
       logger.error('Text query processing failed:', error);
+      throw error;
+    }
+  }
+
+  // Generate contextual response using RAG results
+  async generateContextualResponseWithRAG(queryText, sources, conversationHistory, options = {}) {
+    try {
+      // Prepare context from RAG sources
+      const relevantContent = sources.map(source => source.content).join('\n\n');
+
+      // Build conversation context
+      const conversationContext = conversationHistory.length > 0 
+        ? conversationHistory.slice(-3).map(h => `Q: ${h.query}\nA: ${h.response}`).join('\n\n')
+        : '';
+
+      // Create prompt for AI response
+      const prompt = `You are a helpful legal document assistant. Based on the following document content, please answer the user's question accurately and concisely.
+
+Document Content:
+${relevantContent}
+
+${conversationContext ? `Previous conversation:\n${conversationContext}\n\n` : ''}User Question: ${queryText}
+
+Please provide a clear, accurate answer based only on the document content provided. If the information is not available in the document, please say so clearly.`;
+
+      // Generate AI response using Gemini
+      const model = getVertexAIModel('gemini-pro');
+      const result = await model.generateContent(prompt);
+      const answer = result.response.text();
+
+      return {
+        answer: answer,
+        confidence: sources[0]?.similarity || 0.8,
+        sources: sources,
+        relatedClauses: sources.map(s => s.content),
+        queryType: this.determineQueryType(queryText)
+      };
+
+    } catch (error) {
+      logger.error('Failed to generate contextual response:', error);
       throw error;
     }
   }

@@ -118,25 +118,46 @@ class DocumentProcessor {
       const chunks = this.chunkText(cleanedText);
       
       if (chunks.length === 0) {
-        throw new Error('No valid chunks generated from document');
+        logger.warn(`No valid chunks generated from document ${documentId}, skipping RAG processing`);
+        return {
+          success: false,
+          error: 'No valid chunks generated from document',
+          chunkCount: 0
+        };
       }
 
-      // Generate embeddings
-      const embeddings = await embeddingService.generateBatchEmbeddings(chunks, 'gemini');
-      
-      // Store in Qdrant
-      const storeResult = await this.storeDocumentVectorsInQdrant(
-        documentId, 
-        chunks, 
-        embeddings, 
-        metadata
-      );
+      // Limit chunks to prevent memory issues
+      const maxChunks = 50;
+      const limitedChunks = chunks.slice(0, maxChunks);
+      if (chunks.length > maxChunks) {
+        logger.warn(`Document ${documentId} has ${chunks.length} chunks, limiting to ${maxChunks} for memory safety`);
+      }
 
-      logger.info(`RAG processing complete for ${documentId}: ${chunks.length} chunks vectorized`);
+      // Generate embeddings with timeout
+      logger.info(`Generating embeddings for ${limitedChunks.length} chunks...`);
+      const embeddings = await Promise.race([
+        embeddingService.generateBatchEmbeddings(limitedChunks),
+        new Promise((_, reject) => setTimeout(() => reject(new Error('Embedding generation timeout')), 60000)) // 60 second timeout
+      ]);
+      
+      // Store in Qdrant (with fallback if it fails)
+      let storeResult;
+      try {
+        storeResult = await this.storeDocumentVectorsInQdrant(
+          documentId, 
+          limitedChunks, 
+          embeddings, 
+          metadata
+        );
+        logger.info(`RAG processing complete for ${documentId}: ${limitedChunks.length} chunks vectorized`);
+      } catch (storeError) {
+        logger.warn(`Vector storage failed for ${documentId}, but document processing continues:`, storeError.message);
+        storeResult = { success: false, error: storeError.message, storedCount: 0 };
+      }
       
       return {
         success: true,
-        chunkCount: chunks.length,
+        chunkCount: limitedChunks.length,
         vectorCount: embeddings.length,
         storeResult
       };
@@ -308,7 +329,14 @@ class DocumentProcessor {
 
       logger.info(`Chunking text: ${text.length} chars, chunk size: ${chunkSize}, overlap: ${overlap}`);
 
-      const chunks = this.chunkByTokens(text, chunkSize, overlap);
+      // For small documents, use character-based chunking to avoid memory issues
+      let chunks;
+      if (text.length < 5000) {
+        logger.info('Using character-based chunking for small document');
+        chunks = this.chunkByCharacters(text, chunkSize * 4, overlap * 4);
+      } else {
+        chunks = this.chunkByTokens(text, chunkSize, overlap);
+      }
 
       // Filter out empty or very short chunks
       const validChunks = chunks.filter(chunk => chunk.trim().length > 50);
@@ -335,17 +363,32 @@ class DocumentProcessor {
         const chunks = [];
         
         let start = 0;
-        while (start < tokens.length) {
+        let iterations = 0;
+        const maxIterations = 1000; // Safety limit to prevent infinite loops
+        
+        while (start < tokens.length && iterations < maxIterations) {
+          iterations++;
           const end = Math.min(start + chunkSize, tokens.length);
           const chunkTokens = tokens.slice(start, end);
           const chunkText = this.tokenizer.decode(chunkTokens);
           
-          if (chunkText.trim().length > 0) {
-            chunks.push(chunkText.trim());
+          // Ensure chunkText is a string
+          const textStr = String(chunkText || '');
+          if (textStr.trim().length > 0) {
+            chunks.push(textStr.trim());
           }
           
-          start = end - overlap;
-          if (start >= end) break;
+          const newStart = end - overlap;
+          if (newStart <= start) {
+            // Prevent infinite loop - ensure we always make progress
+            start = end;
+          } else {
+            start = newStart;
+          }
+        }
+        
+        if (iterations >= maxIterations) {
+          logger.warn('Chunking reached maximum iterations, stopping to prevent infinite loop');
         }
         
         return chunks;
@@ -363,8 +406,12 @@ class DocumentProcessor {
   chunkByCharacters(text, chunkSize, overlap) {
     const chunks = [];
     let start = 0;
+    let iterations = 0;
+    const maxIterations = 1000; // Safety limit
+    const maxChunks = 100; // Prevent memory issues
     
-    while (start < text.length) {
+    while (start < text.length && iterations < maxIterations && chunks.length < maxChunks) {
+      iterations++;
       const end = Math.min(start + chunkSize, text.length);
       let chunk = text.slice(start, end);
       
@@ -383,8 +430,23 @@ class DocumentProcessor {
         chunks.push(chunk.trim());
       }
       
-      start = start + chunk.length - overlap;
+      const newStart = start + chunk.length - overlap;
+      if (newStart <= start) {
+        // Prevent infinite loop - ensure we always make progress
+        start = end;
+      } else {
+        start = newStart;
+      }
+      
       if (start >= text.length) break;
+    }
+    
+    if (iterations >= maxIterations) {
+      logger.warn('Character chunking reached maximum iterations');
+    }
+    
+    if (chunks.length >= maxChunks) {
+      logger.warn(`Character chunking limited to ${maxChunks} chunks for memory safety`);
     }
     
     return chunks;

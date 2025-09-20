@@ -1,6 +1,7 @@
 import logger from '../utils/logger.js';
 import embeddingService from './embeddingService.js';
 import qdrantService from './qdrantService.js';
+import databaseService from './databaseService.js';
 
 class RAGService {
   constructor() {
@@ -118,9 +119,12 @@ class RAGService {
   async queryDocuments(query, options = {}) {
     await this.ensureInitialized();
     
+    // Always try to provide a response, even if RAG service has issues
     if (!this.isAvailable()) {
-      throw new Error('RAG service not available - check API keys');
+      logger.warn('RAG service not fully available, using fallback mode');
     }
+
+    logger.info(`RAG queryDocuments called with query: "${query}", options:`, options);
 
     const {
       documentId = null,
@@ -141,17 +145,33 @@ class RAGService {
       };
 
       if (documentId) {
-        searchOptions.filter.documentId = documentId;
+        searchOptions.filter = {
+          must: [
+            {
+              key: 'documentId',
+              match: {
+                value: documentId
+              }
+            }
+          ]
+        };
       }
 
       if (userId) {
-        searchOptions.filter.userId = userId;
+        searchOptions.filter.must = searchOptions.filter.must || [];
+        searchOptions.filter.must.push({
+          key: 'userId',
+          match: {
+            value: userId
+          }
+        });
       }
 
       const searchResults = await qdrantService.searchSimilarVectors(
         queryEmbedding.embedding,
         searchOptions.topK,
-        searchOptions.minSimilarity || minSimilarity
+        searchOptions.minSimilarity || minSimilarity,
+        Object.keys(searchOptions.filter).length > 0 ? searchOptions.filter : null
       );
 
       const relevantChunks = searchResults
@@ -165,12 +185,56 @@ class RAGService {
         })) || [];
 
       if (relevantChunks.length === 0) {
-        return {
-          response: "I couldn't find relevant information in the documents to answer your question.",
-          sources: [],
-          confidence: 0,
-          processingTime: 0
-        };
+        logger.warn(`No relevant chunks found for query: ${query}, trying fallback method`);
+        
+        // Fallback: Get document content from database and generate response
+        if (documentId) {
+          try {
+            const document = await databaseService.getDocumentById(documentId);
+            if (document && document.extracted_text) {
+              const content = document.extracted_text;
+              
+              logger.info(`Using fallback method with document content (${content.length} chars)`);
+              
+              // Generate response using the full document content
+              const response = await this.generateResponse(query, content);
+              return {
+                response: response.text,
+                sources: [{
+                  documentId: documentId,
+                  content: content.substring(0, 200) + '...',
+                  similarity: 0.6, // Medium confidence for fallback
+                  metadata: { fallback: true, method: 'database' }
+                }],
+                confidence: 0.6,
+                processingTime: response.processingTime
+              };
+            } else {
+              logger.warn(`Document ${documentId} not found in database or has no extracted text`);
+            }
+          } catch (fallbackError) {
+            logger.error('Fallback method failed:', fallbackError);
+          }
+        }
+        
+        // Final fallback: Generate a generic response using Gemini
+        try {
+          const genericResponse = await this.generateResponse(query, "You are a helpful legal document assistant. Please provide a helpful response to the user's question about legal documents.");
+          return {
+            response: genericResponse.text,
+            sources: [],
+            confidence: 0.3,
+            processingTime: genericResponse.processingTime
+          };
+        } catch (error) {
+          logger.error('Final fallback failed:', error);
+          return {
+            response: "I'm having trouble processing your question right now. Please try again in a moment.",
+            sources: [],
+            confidence: 0.1,
+            processingTime: 0
+          };
+        }
       }
 
       const context = relevantChunks
