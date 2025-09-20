@@ -1,6 +1,6 @@
 import logger from '../utils/logger.js';
 import embeddingService from './embeddingService.js';
-import pineconeService from './pineconeService.js';
+import qdrantService from './qdrantService.js';
 
 class RAGService {
   constructor() {
@@ -80,7 +80,7 @@ class RAGService {
           
           const chunkData = {
             id: `${documentId}_chunk_${i}`,
-            values: embeddingResult.embedding,
+            vector: embeddingResult.embedding,
             metadata: {
               documentId,
               chunkIndex: i,
@@ -92,7 +92,7 @@ class RAGService {
             }
           };
 
-          await pineconeService.upsertVector(chunkData);
+          await qdrantService.upsertVector(chunkData);
           processedChunks.push(chunkData);
           
         } catch (error) {
@@ -148,12 +148,13 @@ class RAGService {
         searchOptions.filter.userId = userId;
       }
 
-      const searchResults = await pineconeService.queryVectors(
+      const searchResults = await qdrantService.searchSimilarVectors(
         queryEmbedding.embedding,
-        searchOptions
+        searchOptions.topK,
+        searchOptions.minSimilarity || minSimilarity
       );
 
-      const relevantChunks = searchResults.matches
+      const relevantChunks = searchResults
         ?.filter(match => match.score >= minSimilarity)
         ?.map(match => ({
           content: match.metadata?.content || '',
@@ -242,8 +243,15 @@ Answer:`;
 
   async deleteDocumentVectors(documentId) {
     try {
-      await pineconeService.deleteVectors({
-        filter: { documentId }
+      await qdrantService.deleteVectorsByFilter({
+        must: [
+          {
+            key: 'documentId',
+            match: {
+              value: documentId
+            }
+          }
+        ]
       });
       
       logger.info(`Deleted vectors for document ${documentId}`);
@@ -255,14 +263,14 @@ Answer:`;
   }
 
   isAvailable() {
-    return this.initialized && this.model && embeddingService.isAvailable() && pineconeService.isAvailable();
+    return this.initialized && this.model && embeddingService.isAvailable() && qdrantService.isAvailable();
   }
 
   getStatus() {
     return {
       ragService: this.initialized && !!this.model,
       embeddingService: embeddingService.isAvailable(),
-      pineconeService: pineconeService.isAvailable(),
+      qdrantService: qdrantService.isAvailable(),
       availableProviders: embeddingService.getAvailableProviders()
     };
   }

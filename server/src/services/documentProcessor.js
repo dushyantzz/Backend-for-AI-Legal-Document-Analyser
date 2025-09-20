@@ -7,7 +7,7 @@ import mammoth from 'mammoth';
 import { encoding_for_model } from 'tiktoken';
 import databaseService from "./databaseService.js";
 import embeddingService from "./embeddingService.js";
-import pineconeService from "./pineconeService.js";
+import qdrantService from "./qdrantService.js";
 
 const logger = winston.createLogger({
   level: "info",
@@ -124,8 +124,8 @@ class DocumentProcessor {
       // Generate embeddings
       const embeddings = await embeddingService.generateBatchEmbeddings(chunks, 'gemini');
       
-      // Store in Pinecone
-      const storeResult = await pineconeService.storeDocumentVectors(
+      // Store in Qdrant
+      const storeResult = await this.storeDocumentVectorsInQdrant(
         documentId, 
         chunks, 
         embeddings, 
@@ -146,6 +146,51 @@ class DocumentProcessor {
         success: false,
         error: error.message,
         chunkCount: 0
+      };
+    }
+  }
+
+  // Store document vectors in Qdrant
+  async storeDocumentVectorsInQdrant(documentId, chunks, embeddings, metadata) {
+    try {
+      let storedCount = 0;
+      
+      for (let i = 0; i < chunks.length; i++) {
+        const chunk = chunks[i];
+        const embedding = embeddings[i];
+        
+        if (embedding && embedding.embedding) {
+          const vectorData = {
+            id: `${documentId}_chunk_${i}`,
+            vector: embedding.embedding,
+            metadata: {
+              documentId,
+              chunkIndex: i,
+              content: chunk,
+              ...metadata,
+              createdAt: new Date().toISOString()
+            }
+          };
+          
+          const success = await qdrantService.upsertVector(vectorData);
+          if (success) {
+            storedCount++;
+          }
+        }
+      }
+      
+      return {
+        success: storedCount > 0,
+        storedCount,
+        totalChunks: chunks.length
+      };
+    } catch (error) {
+      logger.error('Failed to store vectors in Qdrant:', error);
+      return {
+        success: false,
+        error: error.message,
+        storedCount: 0,
+        totalChunks: chunks.length
       };
     }
   }

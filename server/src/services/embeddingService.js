@@ -102,8 +102,6 @@ class EmbeddingService {
 
   async generateGeminiEmbedding(text) {
     try {
-      // Use text-embedding-004 which produces 768 dimensions
-      // We'll need to pad or use a different model for 1024 dimensions
       const model = this.geminiClient.getGenerativeModel({ 
         model: 'text-embedding-004' 
       });
@@ -114,16 +112,11 @@ class EmbeddingService {
       if (!embedding?.values) {
         throw new Error('Invalid embedding response from Gemini');
       }
-  
-      // Pad the 768-dimensional embedding to 1024 dimensions
-      let paddedEmbedding = [...embedding.values];
-      while (paddedEmbedding.length < 1024) {
-        paddedEmbedding.push(0.0);
-      }
       
+      // Use original 768 dimensions (no padding needed)
       return {
-        embedding: paddedEmbedding.slice(0, 1024), // Ensure exactly 1024 dimensions
-        dimensions: 1024,
+        embedding: embedding.values,
+        dimensions: embedding.values.length,
         model: 'text-embedding-004',
         provider: 'gemini'
       };

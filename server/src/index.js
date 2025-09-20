@@ -22,7 +22,8 @@ if (result.error) {
 console.log('🔍 Environment variables check:');
 console.log('GEMINI_API_KEY exists:', !!process.env.GEMINI_API_KEY);
 console.log('GOOGLE_API_KEY exists:', !!process.env.GOOGLE_API_KEY);
-console.log('PINECONE_API_KEY exists:', !!process.env.PINECONE_API_KEY);
+console.log('QDRANT_URL exists:', !!process.env.QDRANT_URL);
+console.log('QDRANT_API_KEY exists:', !!process.env.QDRANT_API_KEY);
 
 // Now import other modules AFTER environment is loaded
 import express from 'express';
@@ -55,6 +56,9 @@ const io = new Server(server, {
     methods: ["GET", "POST"]
   }
 });
+
+// Make io available to routes
+app.set('io', io);
 
 // Middleware setup
 app.use(helmet({
@@ -182,10 +186,10 @@ async function initializeServices() {
     
     // Import and initialize other services
     try {
-      const pineconeService = await import('./services/pineconeService.js');
-      await pineconeService.default.initialize();
+      const qdrantService = await import('./services/qdrantService.js');
+      await qdrantService.default.initialize();
     } catch (error) {
-      logger.warn('⚠️  Pinecone service initialization failed:', error.message);
+      logger.warn('⚠️  Qdrant service initialization failed:', error.message);
     }
     
     try {
