@@ -1,270 +1,255 @@
-import express from "express";
-import cors from "cors";
-import helmet from "helmet";
-import morgan from "morgan";
-import dotenv from "dotenv";
-import rateLimit from "express-rate-limit";
-import { createServer } from "http";
-import { Server } from "socket.io";
-import winston from "winston";
-import fs from "fs/promises";
-import path from "path";
+// Load environment variables FIRST - before any imports
+import dotenv from 'dotenv';
+import { fileURLToPath } from 'url';
+import { dirname, join } from 'path';
 
-// Import routes
-import documentRoutes from "./routes/documents.js";
-import analysisRoutes from "./routes/analysis.js";
-import voiceRoutes from "./routes/voice.js";
-import chatRoutes from "./routes/chat.js";
-import healthRoutes from "./routes/health.js";
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = dirname(__filename);
 
-// Import services
-import databaseService from "./services/databaseService.js";
-import { setupSocketHandlers } from "./services/socketService.js";
-import pineconeService from "./services/pineconeService.js";
-import embeddingService from "./services/embeddingService.js";
-import ragService from "./services/ragService.js";
+// Load .env from server root directory
+const envPath = join(__dirname, '..', '.env');
+console.log('🔍 Loading .env from:', envPath);
 
-// Load environment variables
-dotenv.config();
+const result = dotenv.config({ path: envPath });
 
-// Create logs directory if it doesn't exist
-try {
-  await fs.mkdir(path.join(process.cwd(), 'logs'), { recursive: true });
-} catch (error) {
-  // Directory might already exist
+if (result.error) {
+  console.error('❌ Error loading .env file:', result.error);
+} else {
+  console.log('✅ .env file loaded successfully');
 }
 
-// Initialize logger
-const logger = winston.createLogger({
-  level: process.env.LOG_LEVEL || "info",
-  format: winston.format.combine(
-    winston.format.timestamp(),
-    winston.format.errors({ stack: true }),
-    winston.format.json(),
-  ),
-  defaultMeta: { service: "lexiplain-backend" },
-  transports: [
-    new winston.transports.File({ filename: "logs/error.log", level: "error" }),
-    new winston.transports.File({ filename: "logs/combined.log" }),
-    new winston.transports.Console({
-      format: winston.format.combine(
-        winston.format.colorize(),
-        winston.format.simple(),
-      ),
-    }),
-  ],
-});
+// Debug environment variables
+console.log('🔍 Environment variables check:');
+console.log('GEMINI_API_KEY exists:', !!process.env.GEMINI_API_KEY);
+console.log('GOOGLE_API_KEY exists:', !!process.env.GOOGLE_API_KEY);
+console.log('PINECONE_API_KEY exists:', !!process.env.PINECONE_API_KEY);
 
-// Create Express app
+// Now import other modules AFTER environment is loaded
+import express from 'express';
+import cors from 'cors';
+import helmet from 'helmet';
+import rateLimit from 'express-rate-limit';
+import { createServer } from 'http';
+import { Server } from 'socket.io';
+import multer from 'multer';
+import path from 'path';
+import fs from 'fs';
+
+// Import utilities
+import logger from './utils/logger.js';
+import { createDatabase } from './database/database.js';
+
+// Import routes
+import documentRoutes from './routes/documents.js';
+import analysisRoutes from './routes/analysis.js';
+import chatRoutes from './routes/chat.js';
+import voiceRoutes from './routes/voice.js';
+
 const app = express();
 const server = createServer(app);
 
 // Initialize Socket.IO
 const io = new Server(server, {
   cors: {
-    origin: process.env.CORS_ORIGIN || "http://localhost:8086",
-    methods: ["GET", "POST"],
-  },
+    origin: process.env.CORS_ORIGIN || "http://localhost:8081",
+    methods: ["GET", "POST"]
+  }
 });
+
+// Middleware setup
+app.use(helmet({
+  crossOriginEmbedderPolicy: false,
+  contentSecurityPolicy: {
+    directives: {
+      defaultSrc: ["'self'"],
+      styleSrc: ["'self'", "'unsafe-inline'"],
+      scriptSrc: ["'self'"],
+      imgSrc: ["'self'", "data:", "https:"],
+    },
+  },
+}));
+
+app.use(cors({
+  origin: process.env.CORS_ORIGIN || "http://localhost:8081",
+  credentials: true
+}));
 
 // Rate limiting
 const limiter = rateLimit({
-  windowMs: parseInt(process.env.RATE_LIMIT_WINDOW_MS) || 15 * 60 * 1000, // 15 minutes
+  windowMs: parseInt(process.env.RATE_LIMIT_WINDOW_MS) || 15 * 60 * 1000,
   max: parseInt(process.env.RATE_LIMIT_MAX_REQUESTS) || 100,
-  message: {
-    error: "Too many requests from this IP, please try again later.",
-    retryAfter: "15 minutes",
-  },
+  message: 'Too many requests from this IP, please try again later.',
+  standardHeaders: true,
+  legacyHeaders: false,
 });
 
-// Middleware
-app.use(helmet());
-app.use(
-  cors({
-    origin: process.env.CORS_ORIGIN || "http://localhost:8086",
-    credentials: true,
-  }),
-);
-app.use(
-  morgan("combined", {
-    stream: { write: (message) => logger.info(message.trim()) },
-  }),
-);
-app.use(express.json({ limit: "50mb" }));
-app.use(express.urlencoded({ extended: true, limit: "50mb" }));
 app.use(limiter);
+app.use(express.json({ limit: '50mb' }));
+app.use(express.urlencoded({ extended: true, limit: '50mb' }));
 
-// Serve uploaded files
-app.use('/uploads', express.static(path.join(process.cwd(), 'uploads')));
+// Ensure uploads directory exists
+const uploadsDir = path.join(__dirname, 'uploads');
+if (!fs.existsSync(uploadsDir)) {
+  fs.mkdirSync(uploadsDir, { recursive: true });
+}
 
-// Make io available to routes
-app.set("io", io);
+// Static file serving
+app.use('/uploads', express.static(uploadsDir));
+
+// Health check endpoint
+app.get('/health', (req, res) => {
+  res.json({ 
+    status: 'ok', 
+    timestamp: new Date().toISOString(),
+    environment: process.env.NODE_ENV || 'development'
+  });
+});
 
 // Routes
-app.use("/api/health", healthRoutes);
-app.use("/api/documents", documentRoutes);
-app.use("/api/analysis", analysisRoutes);
-app.use("/api/voice", voiceRoutes);
-app.use("/api/chat", chatRoutes);
+app.use('/api/documents', documentRoutes);
+app.use('/api/analysis', analysisRoutes);
+app.use('/api/chat', chatRoutes);
+app.use('/api/voice', voiceRoutes);
 
 // Error handling middleware
 app.use((err, req, res, next) => {
-  logger.error(err.stack);
-
-  if (err.code === "LIMIT_FILE_SIZE") {
-    return res.status(400).json({
-      error: "File too large",
-      message: `File size should be less than ${process.env.MAX_FILE_SIZE_MB || 50}MB`,
-    });
+  logger.error('Unhandled error:', err);
+  
+  if (err instanceof multer.MulterError) {
+    if (err.code === 'LIMIT_FILE_SIZE') {
+      return res.status(400).json({
+        error: 'File too large',
+        message: `File size exceeds ${process.env.MAX_FILE_SIZE_MB || 50}MB limit`
+      });
+    }
   }
-
-  if (err.name === 'ValidationError') {
-    return res.status(400).json({
-      error: "Validation Error",
-      message: err.message,
-    });
-  }
-
+  
   res.status(500).json({
-    error: "Something went wrong!",
-    message:
-      process.env.NODE_ENV === "development"
-        ? err.message
-        : "Internal server error",
+    error: 'Internal server error',
+    message: process.env.NODE_ENV === 'development' ? err.message : 'Something went wrong'
   });
 });
 
 // 404 handler
-app.use("*", (req, res) => {
+app.use('*', (req, res) => {
   res.status(404).json({
-    error: "Route not found",
-    message: `Cannot ${req.method} ${req.originalUrl}`,
+    error: 'Not found',
+    message: 'The requested resource was not found'
   });
 });
 
-// Initialize RAG services
-async function initializeRAGServices() {
+// Socket.IO connection handling - SIMPLIFIED
+io.on('connection', (socket) => {
+  logger.info(`Client connected: ${socket.id}`);
+
+  socket.on('disconnect', () => {
+    logger.info(`Client disconnected: ${socket.id}`);
+  });
+
+  socket.on('error', (error) => {
+    logger.error('Socket error:', error);
+  });
+});
+
+// Initialize services after environment is loaded
+async function initializeServices() {
   try {
+    logger.info('🤖 Initializing services...');
+    
+    // Initialize database first
+    await createDatabase();
+    logger.info('✅ Database initialized successfully');
+    
+    // Initialize RAG services
     logger.info('🤖 Initializing RAG services...');
     
-    // Check for required environment variables
-    const requiredEnvVars = {
-      'PINECONE_API_KEY': process.env.PINECONE_API_KEY,
-      'GEMINI_API_KEY': process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY
-    };
-    
-    for (const [key, value] of Object.entries(requiredEnvVars)) {
-      if (!value) {
-        logger.warn(`⚠️  ${key} not found, RAG features may be limited`);
-      }
+    // Check for required API keys
+    if (!process.env.PINECONE_API_KEY) {
+      logger.warn('⚠️  PINECONE_API_KEY not found, RAG features may be limited');
     }
     
-    // Initialize services in order
-    if (requiredEnvVars.PINECONE_API_KEY) {
-      try {
-        await pineconeService.initialize();
-        logger.info('✅ Pinecone service initialized');
-      } catch (error) {
-        logger.error('❌ Failed to initialize Pinecone:', error.message);
-      }
+    if (!process.env.GEMINI_API_KEY && !process.env.GOOGLE_API_KEY) {
+      logger.warn('⚠️  GEMINI_API_KEY not found, RAG features may be limited');
     }
     
-    // Embedding service initializes automatically
+    // Import and initialize embedding service
     try {
-      const embeddingHealth = await embeddingService.healthCheck();
-      if (embeddingHealth.gemini || embeddingHealth.openai) {
-        logger.info('✅ Embedding service initialized');
-      } else {
-        logger.warn('⚠️  No embedding providers available');
-      }
+      const embeddingService = await import('./services/embeddingService.js');
+      await embeddingService.default.initialize();
     } catch (error) {
-      logger.error('❌ Embedding service check failed:', error.message);
+      logger.warn('⚠️  Embedding service initialization failed:', error.message);
     }
     
-    // Initialize RAG service
-    if (requiredEnvVars.GEMINI_API_KEY) {
-      try {
-        await ragService.initialize();
-        logger.info('✅ RAG service initialized');
-      } catch (error) {
-        logger.error('❌ Failed to initialize RAG service:', error.message);
-      }
+    // Import and initialize other services
+    try {
+      const pineconeService = await import('./services/pineconeService.js');
+      await pineconeService.default.initialize();
+    } catch (error) {
+      logger.warn('⚠️  Pinecone service initialization failed:', error.message);
+    }
+    
+    try {
+      const ragService = await import('./services/ragService.js');
+      await ragService.default.initialize();
+    } catch (error) {
+      logger.warn('⚠️  RAG service initialization failed:', error.message);
     }
     
     logger.info('🚀 RAG services initialization complete');
+    
   } catch (error) {
-    logger.error('❌ Failed to initialize RAG services:', error);
-    // Don't exit, let the server run without RAG features
+    logger.error('❌ Service initialization failed:', error);
+    // Continue anyway - some features may be disabled
   }
 }
 
-// Initialize services
+// Graceful shutdown handling
+process.on('SIGTERM', () => {
+  logger.info('SIGTERM received, shutting down gracefully');
+  server.close(() => {
+    logger.info('Server closed');
+    process.exit(0);
+  });
+});
+
+process.on('SIGINT', () => {
+  logger.info('SIGINT received, shutting down gracefully');
+  server.close(() => {
+    logger.info('Server closed');
+    process.exit(0);
+  });
+});
+
+// Uncaught exception handler
+process.on('uncaughtException', (error) => {
+  logger.error('Uncaught Exception:', error);
+  process.exit(1);
+});
+
+// Unhandled rejection handler
+process.on('unhandledRejection', (reason, promise) => {
+  logger.error('Unhandled Rejection at:', promise, 'reason:', reason);
+  process.exit(1);
+});
+
+// Start server
 async function startServer() {
   try {
-    // Create necessary directories
-    const directories = ['uploads/documents', 'data'];
-    for (const dir of directories) {
-      try {
-        await fs.mkdir(path.join(process.cwd(), dir), { recursive: true });
-      } catch (error) {
-        // Directory might already exist
-      }
-    }
+    await initializeServices();
     
-    // Initialize database
-    await databaseService.initialize();
-    logger.info("✅ Database initialized successfully");
-
-    // Initialize RAG services
-    await initializeRAGServices();
-
-    // Setup Socket.IO handlers
-    setupSocketHandlers(io);
-    logger.info("✅ Socket.IO handlers setup complete");
-
-    const PORT = process.env.PORT || 3001;
+    const PORT = process.env.PORT || 3000;
+    
     server.listen(PORT, () => {
-      logger.info(`🚀 LexiPlain Backend Server running on port ${PORT}`);
-      logger.info(
-        `📚 API Documentation available at http://localhost:${PORT}/api/health`,
-      );
-      logger.info(`🌍 Environment: ${process.env.NODE_ENV || 'development'}`);
-      logger.info(`💾 Database: SQLite`);
-      logger.info(`🤖 RAG Features: ${process.env.PINECONE_API_KEY && process.env.GEMINI_API_KEY ? 'Enabled' : 'Limited'}`);
-      logger.info(`🗣️  Chat & Voice features enabled`);
-      logger.info(`📁 File uploads: ${path.join(process.cwd(), 'uploads')}`);
+      logger.info(`🚀 Server running on port ${PORT}`);
+      logger.info(`📁 Environment: ${process.env.NODE_ENV || 'development'}`);
+      logger.info(`🌐 CORS origin: ${process.env.CORS_ORIGIN || 'http://localhost:8086'}`);
+      logger.info(`✅ Socket.IO handlers setup complete`);
     });
+    
   } catch (error) {
-    logger.error("❌ Failed to start server:", error);
+    logger.error('❌ Failed to start server:', error);
     process.exit(1);
   }
 }
 
-// Graceful shutdown
-process.on("SIGTERM", () => {
-  logger.info("SIGTERM signal received: closing HTTP server");
-  server.close(() => {
-    logger.info("HTTP server closed");
-  });
-});
-
-process.on("SIGINT", () => {
-  logger.info("SIGINT signal received: closing HTTP server");
-  server.close(() => {
-    logger.info("HTTP server closed");
-  });
-});
-
-// Handle uncaught exceptions
-process.on("uncaughtException", (error) => {
-  logger.error("Uncaught Exception:", error);
-  process.exit(1);
-});
-
-process.on("unhandledRejection", (reason, promise) => {
-  logger.error("Unhandled Rejection at:", promise, "reason:", reason);
-  process.exit(1);
-});
-
-// Start the server
 startServer();

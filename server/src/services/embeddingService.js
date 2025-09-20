@@ -1,340 +1,258 @@
-import { GoogleGenerativeAI } from '@google/generative-ai';
-import OpenAI from 'openai';
-import winston from 'winston';
-
-const logger = winston.createLogger({
-  level: 'info',
-  format: winston.format.combine(
-    winston.format.timestamp(),
-    winston.format.json()
-  ),
-  transports: [
-    new winston.transports.Console()
-  ]
-});
+import logger from '../utils/logger.js';
 
 class EmbeddingService {
   constructor() {
-    this.gemini = null;
-    this.openai = null;
-    this.defaultProvider = 'gemini';
-    this.dimensions = 768; // Gemini embedding dimensions
-    this.initializeClients();
+    this.geminiClient = null;
+    this.openaiClient = null;
+    this.initialized = false;
+    this.cache = new Map();
+    
+    logger.info('EmbeddingService created (not initialized yet)');
   }
 
-  /**
-   * Initialize AI clients
-   */
-  initializeClients() {
+  async initialize() {
+    if (this.initialized) {
+      return;
+    }
+
     try {
-      // Initialize Gemini
-      if (process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY) {
-        const apiKey = process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY;
-        this.gemini = new GoogleGenerativeAI(apiKey);
-        logger.info('Gemini client initialized for embeddings');
-      }
-
-      // Initialize OpenAI as fallback
-      if (process.env.OPENAI_API_KEY) {
-        this.openai = new OpenAI({
-          apiKey: process.env.OPENAI_API_KEY
-        });
-        logger.info('OpenAI client initialized for embeddings');
-      }
-
-      if (!this.gemini && !this.openai) {
-        throw new Error('No embedding service API keys provided');
-      }
+      await this.initializeClients();
+      this.initialized = true;
+      logger.info('✅ EmbeddingService initialized successfully');
     } catch (error) {
-      logger.error('Failed to initialize embedding clients:', error);
-      throw error;
+      logger.warn('⚠️ EmbeddingService initialization failed:', error.message);
+      // Don't throw error - allow service to continue without embeddings
     }
   }
 
-  /**
-   * Generate embeddings using Gemini
-   */
+  async initializeClients() {
+    const geminiKey = process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY;
+    const openaiKey = process.env.OPENAI_API_KEY;
+
+    logger.info('🔍 Checking API keys...');
+    logger.info('Gemini key exists:', !!geminiKey);
+    logger.info('OpenAI key exists:', !!openaiKey);
+
+    if (!geminiKey && !openaiKey) {
+      logger.warn('⚠️  No embedding providers available');
+      return;
+    }
+
+    if (geminiKey) {
+      try {
+        const { GoogleGenerativeAI } = await import('@google/generative-ai');
+        this.geminiClient = new GoogleGenerativeAI(geminiKey);
+        logger.info('✅ Gemini client initialized for embeddings');
+      } catch (error) {
+        logger.error('Failed to initialize Gemini client:', error);
+      }
+    }
+
+    if (openaiKey) {
+      try {
+        const { OpenAI } = await import('openai');
+        this.openaiClient = new OpenAI({
+          apiKey: openaiKey,
+        });
+        logger.info('✅ OpenAI client initialized for embeddings');
+      } catch (error) {
+        logger.error('Failed to initialize OpenAI client:', error);
+      }
+    }
+  }
+
+  async ensureInitialized() {
+    if (!this.initialized) {
+      await this.initialize();
+    }
+  }
+
+  async generateEmbedding(text) {
+    await this.ensureInitialized();
+    
+    if (!this.geminiClient && !this.openaiClient) {
+      throw new Error('No embedding providers available - check API keys');
+    }
+
+    const cacheKey = `embedding_${this.hashString(text)}`;
+    if (this.cache.has(cacheKey)) {
+      return this.cache.get(cacheKey);
+    }
+
+    let embedding;
+    
+    if (this.geminiClient) {
+      embedding = await this.generateGeminiEmbedding(text);
+    } else if (this.openaiClient) {
+      embedding = await this.generateOpenAIEmbedding(text);
+    }
+
+    if (embedding) {
+      this.cache.set(cacheKey, embedding);
+      
+      // Limit cache size
+      if (this.cache.size > 1000) {
+        const firstKey = this.cache.keys().next().value;
+        this.cache.delete(firstKey);
+      }
+    }
+
+    return embedding;
+  }
+
   async generateGeminiEmbedding(text) {
     try {
-      if (!this.gemini) {
-        throw new Error('Gemini client not initialized');
-      }
-
-      const model = this.gemini.getGenerativeModel({ model: 'embedding-001' });
-      const result = await model.embedContent(text);
+      // Use text-embedding-004 which produces 768 dimensions
+      // We'll need to pad or use a different model for 1024 dimensions
+      const model = this.geminiClient.getGenerativeModel({ 
+        model: 'text-embedding-004' 
+      });
       
-      return result.embedding.values;
+      const result = await model.embedContent(text);
+      const embedding = result.embedding;
+      
+      if (!embedding?.values) {
+        throw new Error('Invalid embedding response from Gemini');
+      }
+  
+      // Pad the 768-dimensional embedding to 1024 dimensions
+      let paddedEmbedding = [...embedding.values];
+      while (paddedEmbedding.length < 1024) {
+        paddedEmbedding.push(0.0);
+      }
+      
+      return {
+        embedding: paddedEmbedding.slice(0, 1024), // Ensure exactly 1024 dimensions
+        dimensions: 1024,
+        model: 'text-embedding-004',
+        provider: 'gemini'
+      };
     } catch (error) {
-      logger.error('Error generating Gemini embedding:', error);
-      throw error;
+      logger.error('Gemini embedding generation failed:', error);
+      throw new Error(`Gemini embedding failed: ${error.message}`);
     }
   }
+  
 
-  /**
-   * Generate embeddings using OpenAI
-   */
-  async generateOpenAIEmbedding(text, model = 'text-embedding-3-small') {
+  async generateOpenAIEmbedding(text) {
     try {
-      if (!this.openai) {
-        throw new Error('OpenAI client not initialized');
-      }
-
-      const response = await this.openai.embeddings.create({
-        model: model,
+      const response = await this.openaiClient.embeddings.create({
+        model: process.env.EMBEDDING_MODEL || 'text-embedding-3-small',
         input: text,
-        dimensions: model === 'text-embedding-3-small' ? 1536 : 3072
       });
 
-      return response.data[0].embedding;
+      const embedding = response.data[0].embedding;
+      
+      return {
+        embedding,
+        dimensions: embedding.length,
+        model: process.env.EMBEDDING_MODEL || 'text-embedding-3-small',
+        provider: 'openai'
+      };
     } catch (error) {
-      logger.error('Error generating OpenAI embedding:', error);
-      throw error;
+      logger.error('OpenAI embedding generation failed:', error);
+      throw new Error(`OpenAI embedding failed: ${error.message}`);
     }
   }
 
-  /**
-   * Generate single embedding with preferred provider
-   */
-  async generateEmbedding(text, provider = this.defaultProvider) {
-    try {
-      if (!text || text.trim().length === 0) {
-        throw new Error('Text cannot be empty');
-      }
-
-      // Truncate text if too long (Gemini has limits)
-      const maxLength = 2048;
-      const truncatedText = text.length > maxLength ? text.substring(0, maxLength) : text;
-
-      if (provider === 'gemini' && this.gemini) {
-        return await this.generateGeminiEmbedding(truncatedText);
-      } else if (provider === 'openai' && this.openai) {
-        return await this.generateOpenAIEmbedding(truncatedText);
-      } else {
-        // Fallback to available provider
-        if (this.gemini) {
-          logger.info('Falling back to Gemini for embedding');
-          return await this.generateGeminiEmbedding(truncatedText);
-        } else if (this.openai) {
-          logger.info('Falling back to OpenAI for embedding');
-          return await this.generateOpenAIEmbedding(truncatedText);
-        } else {
-          throw new Error('No embedding providers available');
-        }
-      }
-    } catch (error) {
-      logger.error('Error generating embedding:', error);
-      throw error;
+  async generateBatchEmbeddings(texts) {
+    await this.ensureInitialized();
+    
+    if (!this.geminiClient && !this.openaiClient) {
+      throw new Error('No embedding providers available - check API keys');
     }
+
+    const embeddings = [];
+    
+    for (const text of texts) {
+      try {
+        const embedding = await this.generateEmbedding(text);
+        embeddings.push(embedding);
+      } catch (error) {
+        logger.error(`Failed to generate embedding for text: ${text.substring(0, 100)}...`, error);
+        embeddings.push(null);
+      }
+    }
+
+    return embeddings;
   }
 
-  /**
-   * Generate embeddings for multiple texts in batch
-   */
-  async generateBatchEmbeddings(texts, provider = this.defaultProvider, options = {}) {
-    try {
-      const {
-        batchSize = 10, // Smaller batch size for Gemini
-        delay = 500 // Delay between batches
-      } = options;
+  chunkText(text, chunkSize = 1000, overlap = 200) {
+    if (!text || typeof text !== 'string') {
+      return [];
+    }
 
-      const allEmbeddings = [];
+    const chunks = [];
+    let start = 0;
+
+    while (start < text.length) {
+      let end = start + chunkSize;
       
-      logger.info(`Generating embeddings for ${texts.length} texts using ${provider}`);
-      
-      // Process in batches to avoid rate limits
-      for (let i = 0; i < texts.length; i += batchSize) {
-        const batch = texts.slice(i, i + batchSize);
+      if (end < text.length) {
+        const lastPeriod = text.lastIndexOf('.', end);
+        const lastNewline = text.lastIndexOf('\n', end);
+        const lastSpace = text.lastIndexOf(' ', end);
         
-        logger.info(`Processing embedding batch ${Math.floor(i / batchSize) + 1} of ${Math.ceil(texts.length / batchSize)}`);
-        
-        const batchPromises = batch.map(text => this.generateEmbedding(text, provider));
-        const batchEmbeddings = await Promise.all(batchPromises);
-        
-        allEmbeddings.push(...batchEmbeddings);
-        
-        // Add delay between batches to respect rate limits
-        if (i + batchSize < texts.length && delay > 0) {
-          await new Promise(resolve => setTimeout(resolve, delay));
+        const breakPoint = Math.max(lastPeriod, lastNewline, lastSpace);
+        if (breakPoint > start + chunkSize * 0.5) {
+          end = breakPoint + 1;
         }
       }
 
-      logger.info(`Generated ${allEmbeddings.length} embeddings using ${provider}`);
-      return allEmbeddings;
-    } catch (error) {
-      logger.error('Error generating batch embeddings:', error);
-      throw error;
-    }
-  }
-
-  /**
-   * Generate query embedding (optimized for search)
-   */
-  async generateQueryEmbedding(query, provider = this.defaultProvider) {
-    try {
-      logger.info(`Generating query embedding using ${provider}`);
-      return await this.generateEmbedding(query, provider);
-    } catch (error) {
-      logger.error('Error generating query embedding:', error);
-      throw error;
-    }
-  }
-
-  /**
-   * Calculate cosine similarity between two embeddings
-   */
-  calculateCosineSimilarity(embedding1, embedding2) {
-    try {
-      if (embedding1.length !== embedding2.length) {
-        throw new Error('Embeddings must have the same dimension');
+      const chunk = text.slice(start, end).trim();
+      if (chunk) {
+        chunks.push({
+          text: chunk,
+          start,
+          end,
+          index: chunks.length
+        });
       }
 
-      let dotProduct = 0;
-      let norm1 = 0;
-      let norm2 = 0;
-
-      for (let i = 0; i < embedding1.length; i++) {
-        dotProduct += embedding1[i] * embedding2[i];
-        norm1 += embedding1[i] ** 2;
-        norm2 += embedding2[i] ** 2;
-      }
-
-      norm1 = Math.sqrt(norm1);
-      norm2 = Math.sqrt(norm2);
-
-      if (norm1 === 0 || norm2 === 0) {
-        return 0;
-      }
-
-      return dotProduct / (norm1 * norm2);
-    } catch (error) {
-      logger.error('Error calculating cosine similarity:', error);
-      return 0;
+      start = Math.max(start + chunkSize - overlap, end);
     }
+
+    return chunks;
   }
 
-  /**
-   * Get embedding dimensions for current provider
-   */
-  getEmbeddingDimensions(provider = this.defaultProvider) {
-    if (provider === 'gemini') {
-      return 768;
-    } else if (provider === 'openai') {
-      return 1536; // for text-embedding-3-small
-    }
-    return this.dimensions;
-  }
-
-  /**
-   * Validate embedding vector
-   */
-  validateEmbedding(embedding) {
-    if (!Array.isArray(embedding)) {
-      return false;
+  hashString(str) {
+    let hash = 0;
+    if (str.length === 0) return hash;
+    
+    for (let i = 0; i < str.length; i++) {
+      const char = str.charCodeAt(i);
+      hash = ((hash << 5) - hash) + char;
+      hash = hash & hash;
     }
     
-    if (embedding.length === 0) {
-      return false;
-    }
-    
-    // Check if all elements are numbers
-    return embedding.every(val => typeof val === 'number' && !isNaN(val));
+    return hash.toString();
   }
 
-  /**
-   * Normalize embedding vector
-   */
-  normalizeEmbedding(embedding) {
-    try {
-      const norm = Math.sqrt(embedding.reduce((sum, val) => sum + val * val, 0));
-      if (norm === 0) {
-        return embedding;
-      }
-      return embedding.map(val => val / norm);
-    } catch (error) {
-      logger.error('Error normalizing embedding:', error);
-      return embedding;
-    }
-  }
-
-  /**
-   * Get available providers
-   */
-  getAvailableProviders() {
-    const providers = [];
-    if (this.gemini) providers.push('gemini');
-    if (this.openai) providers.push('openai');
-    return providers;
-  }
-
-  /**
-   * Switch default provider
-   */
-  setDefaultProvider(provider) {
-    const available = this.getAvailableProviders();
-    if (available.includes(provider)) {
-      this.defaultProvider = provider;
-      this.dimensions = this.getEmbeddingDimensions(provider);
-      logger.info(`Default embedding provider set to: ${provider}`);
-    } else {
-      throw new Error(`Provider ${provider} not available. Available: ${available.join(', ')}`);
-    }
-  }
-
-  /**
-   * Health check for embedding services
-   */
-  async healthCheck() {
-    const health = {
-      gemini: false,
-      openai: false,
-      defaultProvider: this.defaultProvider,
-      dimensions: this.dimensions,
-      availableProviders: []
-    };
-
-    try {
-      if (this.gemini) {
-        await this.generateGeminiEmbedding('test');
-        health.gemini = true;
-        health.availableProviders.push('gemini');
-      }
-    } catch (error) {
-      logger.warn('Gemini embedding health check failed:', error.message);
-    }
-
-    try {
-      if (this.openai) {
-        await this.generateOpenAIEmbedding('test');
-        health.openai = true;
-        health.availableProviders.push('openai');
-      }
-    } catch (error) {
-      logger.warn('OpenAI embedding health check failed:', error.message);
-    }
-
-    return health;
-  }
-
-  /**
-   * Clear any cached embeddings (if caching is implemented)
-   */
   clearCache() {
-    // Placeholder for future caching implementation
+    this.cache.clear();
     logger.info('Embedding cache cleared');
   }
 
-  /**
-   * Get embedding statistics
-   */
-  getStats() {
+  getCacheStats() {
     return {
-      defaultProvider: this.defaultProvider,
-      dimensions: this.dimensions,
-      availableProviders: this.getAvailableProviders(),
-      geminiAvailable: !!this.gemini,
-      openaiAvailable: !!this.openai
+      size: this.cache.size,
+      maxSize: 1000
     };
+  }
+
+  isAvailable() {
+    return this.initialized && (this.geminiClient || this.openaiClient);
+  }
+
+  getAvailableProviders() {
+    const providers = [];
+    if (this.geminiClient) providers.push('gemini');
+    if (this.openaiClient) providers.push('openai');
+    return providers;
   }
 }
 
-export default new EmbeddingService();
+// Create instance but don't initialize immediately
+const embeddingService = new EmbeddingService();
+
+export default embeddingService;

@@ -1,465 +1,273 @@
-import { GoogleGenerativeAI } from '@google/generative-ai';
+import logger from '../utils/logger.js';
 import embeddingService from './embeddingService.js';
 import pineconeService from './pineconeService.js';
-import winston from 'winston';
-
-const logger = winston.createLogger({
-  level: 'info',
-  format: winston.format.combine(
-    winston.format.timestamp(),
-    winston.format.json()
-  ),
-  transports: [
-    new winston.transports.Console()
-  ]
-});
 
 class RAGService {
   constructor() {
-    this.gemini = null;
+    this.genAI = null;
+    this.model = null;
     this.initialized = false;
-    this.defaultModel = 'gemini-pro';
-    this.maxContextLength = 4000;
-    this.initializeClient();
+    
+    logger.info('RAGService created (not initialized yet)');
   }
 
-  /**
-   * Initialize Gemini client
-   */
-  initializeClient() {
-    try {
-      const apiKey = process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY;
-      if (!apiKey) {
-        throw new Error('GEMINI_API_KEY or GOOGLE_API_KEY environment variable is required');
-      }
-
-      this.gemini = new GoogleGenerativeAI(apiKey);
-      logger.info('RAG Service: Gemini client initialized');
-    } catch (error) {
-      logger.error('Failed to initialize RAG service:', error);
-      throw error;
-    }
-  }
-
-  /**
-   * Initialize all required services
-   */
   async initialize() {
+    if (this.initialized) {
+      return;
+    }
+
     try {
-      logger.info('Initializing RAG service...');
-      
-      // Initialize Pinecone
-      if (!pineconeService.initialized) {
-        await pineconeService.initialize();
-      }
-      
+      await this.initializeClient();
       this.initialized = true;
-      logger.info('RAG service fully initialized');
-      return true;
+      logger.info('✅ RAGService initialized successfully');
     } catch (error) {
-      logger.error('Failed to initialize RAG service:', error);
-      this.initialized = false;
+      logger.warn('⚠️  RAG Service: No API key provided - RAG functionality will be disabled');
+    }
+  }
+
+  async initializeClient() {
+    const apiKey = process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY;
+    
+    if (!apiKey) {
+      logger.warn('⚠️  No Gemini API key found');
+      return;
+    }
+
+    try {
+      const { GoogleGenerativeAI } = await import('@google/generative-ai');
+      this.genAI = new GoogleGenerativeAI(apiKey);
+      this.model = this.genAI.getGenerativeModel({ 
+        model: process.env.GEMINI_MODEL || 'gemini-1.5-flash' 
+      });
+      logger.info('✅ Gemini client initialized for RAG');
+    } catch (error) {
+      logger.error('Failed to initialize Gemini client:', error);
       throw error;
     }
   }
 
-  /**
-   * Process a document for RAG (called during document upload)
-   */
-  async processDocument(documentId, text, metadata = {}) {
-    try {
-      if (!this.initialized) {
-        await this.initialize();
-      }
+  async ensureInitialized() {
+    if (!this.initialized) {
+      await this.initialize();
+    }
+  }
 
+  async processDocument(documentId, content, metadata = {}) {
+    await this.ensureInitialized();
+    
+    if (!this.isAvailable()) {
+      throw new Error('RAG service not available - check API keys');
+    }
+
+    try {
       logger.info(`Processing document ${documentId} for RAG`);
 
-      // This is handled by the document processor
-      // This method is mainly for external calls
+      const chunks = embeddingService.chunkText(
+        content,
+        parseInt(process.env.CHUNK_SIZE) || 1000,
+        parseInt(process.env.CHUNK_OVERLAP) || 200
+      );
+
+      logger.info(`Generated ${chunks.length} chunks for document ${documentId}`);
+
+      const processedChunks = [];
+      
+      for (let i = 0; i < chunks.length; i++) {
+        const chunk = chunks[i];
+        
+        try {
+          const embeddingResult = await embeddingService.generateEmbedding(chunk.text);
+          
+          const chunkData = {
+            id: `${documentId}_chunk_${i}`,
+            values: embeddingResult.embedding,
+            metadata: {
+              documentId,
+              chunkIndex: i,
+              content: chunk.text,
+              startPosition: chunk.start,
+              endPosition: chunk.end,
+              ...metadata,
+              createdAt: new Date().toISOString()
+            }
+          };
+
+          await pineconeService.upsertVector(chunkData);
+          processedChunks.push(chunkData);
+          
+        } catch (error) {
+          logger.error(`Failed to process chunk ${i} for document ${documentId}:`, error);
+        }
+      }
+
+      logger.info(`Successfully processed ${processedChunks.length}/${chunks.length} chunks for document ${documentId}`);
+      
       return {
-        success: true,
-        message: 'Document processing is handled by documentProcessor service'
+        documentId,
+        totalChunks: chunks.length,
+        processedChunks: processedChunks.length,
+        failed: chunks.length - processedChunks.length
       };
+
     } catch (error) {
-      logger.error('Error processing document for RAG:', error);
+      logger.error(`Failed to process document ${documentId}:`, error);
       throw error;
     }
   }
 
-  /**
-   * Ask a question about documents
-   */
-  async askQuestion(question, options = {}) {
+  async queryDocuments(query, options = {}) {
+    await this.ensureInitialized();
+    
+    if (!this.isAvailable()) {
+      throw new Error('RAG service not available - check API keys');
+    }
+
+    const {
+      documentId = null,
+      userId = null,
+      maxResults = 5,
+      minSimilarity = 0.7
+    } = options;
+
     try {
-      if (!this.initialized) {
-        await this.initialize();
+      logger.info(`Processing RAG query: ${query.substring(0, 100)}...`);
+
+      const queryEmbedding = await embeddingService.generateEmbedding(query);
+      
+      const searchOptions = {
+        topK: maxResults,
+        includeMetadata: true,
+        filter: {}
+      };
+
+      if (documentId) {
+        searchOptions.filter.documentId = documentId;
       }
 
-      const {
-        documentId = null,
-        userId = null,
-        maxResults = 5,
-        minSimilarity = 0.7,
-        includeSourceText = true,
-        conversationHistory = []
-      } = options;
+      if (userId) {
+        searchOptions.filter.userId = userId;
+      }
 
-      logger.info(`Processing question: "${question.substring(0, 100)}..."`);
+      const searchResults = await pineconeService.queryVectors(
+        queryEmbedding.embedding,
+        searchOptions
+      );
 
-      // Step 1: Generate query embedding
-      const queryEmbedding = await embeddingService.generateQueryEmbedding(question, 'gemini');
-      
-      // Step 2: Search for relevant chunks
-      const searchResults = await pineconeService.searchSimilarChunks(queryEmbedding, {
-        topK: maxResults * 2, // Get more results to filter
-        minScore: minSimilarity,
-        documentId,
-        userId
-      });
+      const relevantChunks = searchResults.matches
+        ?.filter(match => match.score >= minSimilarity)
+        ?.map(match => ({
+          content: match.metadata?.content || '',
+          score: match.score,
+          documentId: match.metadata?.documentId,
+          chunkIndex: match.metadata?.chunkIndex,
+          metadata: match.metadata
+        })) || [];
 
-      if (searchResults.filteredResults === 0) {
+      if (relevantChunks.length === 0) {
         return {
-          answer: "I couldn't find relevant information in the provided documents to answer your question. Please try rephrasing your question or ensure the document contains the information you're looking for.",
-          confidence: 0.1,
+          response: "I couldn't find relevant information in the documents to answer your question.",
           sources: [],
-          metadata: {
-            searchResults: 0,
-            searchPerformed: true,
-            documentId,
-            userId
-          }
+          confidence: 0,
+          processingTime: 0
         };
       }
 
-      // Step 3: Prepare context from retrieved chunks
-      const context = this.prepareContext(searchResults.matches, maxResults);
-      
-      // Step 4: Generate answer using Gemini
-      const answer = await this.generateAnswer(question, context, conversationHistory);
-      
-      // Step 5: Prepare response with sources
-      const sources = searchResults.matches.slice(0, maxResults).map((match, index) => ({
-        chunkIndex: match.metadata?.chunkIndex || index,
-        documentId: match.metadata?.documentId,
-        filename: match.metadata?.filename,
-        text: includeSourceText ? (match.metadata?.text || '').substring(0, 300) + '...' : undefined,
-        similarity: match.score || 0,
-        relevantTo: question.substring(0, 100)
-      }));
+      const context = relevantChunks
+        .map(chunk => chunk.content)
+        .join('\n\n');
 
-      const confidence = this.calculateConfidence(searchResults.matches, answer);
-
-      logger.info(`Generated answer with confidence ${confidence} using ${sources.length} sources`);
+      const response = await this.generateResponse(query, context);
 
       return {
-        answer: answer.trim(),
-        confidence,
-        sources,
-        metadata: {
-          searchResults: searchResults.totalResults,
-          filteredResults: searchResults.filteredResults,
-          contextLength: context.length,
-          searchPerformed: true,
-          documentId,
-          userId,
-          model: this.defaultModel
-        }
+        response: response.text,
+        sources: relevantChunks.map(chunk => ({
+          documentId: chunk.documentId,
+          chunkIndex: chunk.chunkIndex,
+          content: chunk.content.substring(0, 200) + '...',
+          similarity: chunk.score,
+          metadata: chunk.metadata
+        })),
+        confidence: this.calculateConfidence(relevantChunks),
+        processingTime: response.processingTime
       };
+
     } catch (error) {
-      logger.error('Error answering question:', error);
-      return {
-        answer: `I encountered an error while processing your question: ${error.message}. Please try again or contact support if the issue persists.`,
-        confidence: 0,
-        sources: [],
-        metadata: {
-          error: error.message,
-          searchPerformed: false
-        }
-      };
+      logger.error('RAG query failed:', error);
+      throw error;
     }
   }
 
-  /**
-   * Prepare context from search results
-   */
-  prepareContext(matches, maxSources = 5) {
-    let context = '';
-    let contextLength = 0;
-    const usedSources = [];
-
-    // Sort by relevance score
-    const sortedMatches = matches.sort((a, b) => (b.score || 0) - (a.score || 0));
-
-    for (const match of sortedMatches.slice(0, maxSources)) {
-      const text = match.metadata?.text || '';
-      
-      // Avoid very short or very long chunks
-      if (text.length < 50 || text.length > 2000) {
-        continue;
-      }
-
-      // Check if we have room for this chunk
-      if (contextLength + text.length > this.maxContextLength) {
-        // If we already have some context, stop here
-        if (usedSources.length > 0) {
-          break;
-        }
-        // Otherwise, truncate this chunk to fit
-        const remainingLength = this.maxContextLength - contextLength - 100;
-        if (remainingLength > 200) {
-          const truncatedText = text.substring(0, remainingLength) + '...';
-          context += `\n\nSource ${usedSources.length + 1}:\n${truncatedText}`;
-          usedSources.push(match);
-        }
-        break;
-      }
-
-      context += `\n\nSource ${usedSources.length + 1}:\n${text}`;
-      contextLength += text.length + 50; // Account for formatting
-      usedSources.push(match);
-    }
-
-    logger.info(`Prepared context with ${usedSources.length} sources, ${contextLength} characters`);
-    return context;
-  }
-
-  /**
-   * Generate answer using Gemini
-   */
-  async generateAnswer(question, context, conversationHistory = []) {
-    try {
-      const model = this.gemini.getGenerativeModel({ model: this.defaultModel });
-
-      // Prepare conversation context
-      let conversationContext = '';
-      if (conversationHistory.length > 0) {
-        conversationContext = '\n\nPrevious conversation:\n' + 
-          conversationHistory.slice(-3).map(msg => 
-            `${msg.role}: ${msg.content}`
-          ).join('\n');
-      }
-
-      const prompt = `You are a helpful AI assistant that answers questions based on provided document context. 
-Please provide accurate, concise answers based only on the information given in the context.
+  async generateResponse(query, context) {
+    const startTime = Date.now();
+    
+    const prompt = `
+You are a helpful AI assistant that answers questions based on provided document context.
 
 Context from documents:
 ${context}
-${conversationContext}
 
-Question: ${question}
+Question: ${query}
 
 Instructions:
-1. Answer based only on the provided context
-2. If the context doesn't contain relevant information, say so clearly
-3. Be concise but thorough
-4. If referencing specific parts of the context, mention which source
-5. Use a professional, helpful tone
+- Answer the question using only the information provided in the context
+- Be concise and accurate
+- If the context doesn't contain enough information to answer the question, say so
+- Cite specific parts of the context when relevant
+- Do not make up information not present in the context
 
 Answer:`;
 
-      const result = await model.generateContent(prompt);
-      const response = await result.response;
-      const answer = response.text();
-
-      if (!answer || answer.trim().length === 0) {
-        throw new Error('Empty response from Gemini');
-      }
-
-      return answer;
-    } catch (error) {
-      logger.error('Error generating answer with Gemini:', error);
-      throw new Error(`Failed to generate answer: ${error.message}`);
-    }
-  }
-
-  /**
-   * Calculate confidence based on search results and answer quality
-   */
-  calculateConfidence(matches, answer) {
-    if (!matches || matches.length === 0) {
-      return 0.1;
-    }
-
-    // Base confidence on similarity scores
-    const avgSimilarity = matches.reduce((sum, match) => sum + (match.score || 0), 0) / matches.length;
-    
-    // Adjust based on number of sources
-    const sourceMultiplier = Math.min(matches.length / 3, 1);
-    
-    // Adjust based on answer length (very short answers might be less confident)
-    const answerLengthMultiplier = answer.length < 50 ? 0.8 : 1;
-    
-    // Check if answer indicates uncertainty
-    const uncertaintyPenalty = (
-      answer.toLowerCase().includes("i don't know") ||
-      answer.toLowerCase().includes("not sure") ||
-      answer.toLowerCase().includes("unclear")
-    ) ? 0.7 : 1;
-
-    const confidence = avgSimilarity * sourceMultiplier * answerLengthMultiplier * uncertaintyPenalty;
-    
-    return Math.max(0.1, Math.min(0.99, confidence));
-  }
-
-  /**
-   * Get document summary
-   */
-  async summarizeDocument(documentId, options = {}) {
     try {
-      const { maxLength = 500, userId = null } = options;
-      
-      // Get document chunks
-      const dummyEmbedding = new Array(768).fill(0);
-      const searchResults = await pineconeService.searchSimilarChunks(dummyEmbedding, {
-        topK: 20,
-        minScore: 0,
-        documentId,
-        userId
-      });
-
-      if (searchResults.matches.length === 0) {
-        return {
-          summary: 'Document not found or no content available for summarization.',
-          confidence: 0.1
-        };
-      }
-
-      // Prepare content for summarization
-      const content = searchResults.matches
-        .sort((a, b) => (a.metadata?.chunkIndex || 0) - (b.metadata?.chunkIndex || 0))
-        .map(match => match.metadata?.text || '')
-        .join('\n\n');
-
-      const model = this.gemini.getGenerativeModel({ model: this.defaultModel });
-      
-      const prompt = `Please provide a comprehensive summary of the following document content. 
-The summary should be approximately ${maxLength} characters and capture the key points, main topics, and important details.
-
-Document content:
-${content.substring(0, 8000)}
-
-Summary:`;
-
-      const result = await model.generateContent(prompt);
+      const result = await this.model.generateContent(prompt);
       const response = await result.response;
-      const summary = response.text();
-
+      
       return {
-        summary: summary.trim(),
-        confidence: 0.8,
-        documentId,
-        chunkCount: searchResults.matches.length
+        text: response.text(),
+        processingTime: Date.now() - startTime
       };
     } catch (error) {
-      logger.error('Error summarizing document:', error);
+      logger.error('Failed to generate response:', error);
+      throw new Error(`Response generation failed: ${error.message}`);
+    }
+  }
+
+  calculateConfidence(chunks) {
+    if (!chunks || chunks.length === 0) return 0;
+    
+    const avgScore = chunks.reduce((sum, chunk) => sum + chunk.score, 0) / chunks.length;
+    const maxScore = Math.max(...chunks.map(chunk => chunk.score));
+    
+    return Math.round((avgScore * 0.7 + maxScore * 0.3) * 100) / 100;
+  }
+
+  async deleteDocumentVectors(documentId) {
+    try {
+      await pineconeService.deleteVectors({
+        filter: { documentId }
+      });
+      
+      logger.info(`Deleted vectors for document ${documentId}`);
+      return true;
+    } catch (error) {
+      logger.error(`Failed to delete vectors for document ${documentId}:`, error);
       throw error;
     }
   }
 
-  /**
-   * Get related questions for a document
-   */
-  async getRelatedQuestions(documentId, options = {}) {
-    try {
-      const { count = 5, userId = null } = options;
-
-      // Get some document content
-      const dummyEmbedding = new Array(768).fill(0);
-      const searchResults = await pineconeService.searchSimilarChunks(dummyEmbedding, {
-        topK: 5,
-        minScore: 0,
-        documentId,
-        userId
-      });
-
-      if (searchResults.matches.length === 0) {
-        return {
-          questions: [],
-          documentId
-        };
-      }
-
-      const content = searchResults.matches
-        .map(match => match.metadata?.text || '')
-        .join('\n\n')
-        .substring(0, 2000);
-
-      const model = this.gemini.getGenerativeModel({ model: this.defaultModel });
-      
-      const prompt = `Based on the following document content, generate ${count} relevant questions that someone might ask about this document. 
-The questions should be specific, useful, and answerable from the content.
-
-Document content:
-${content}
-
-Generate ${count} questions (one per line, numbered):`;
-
-      const result = await model.generateContent(prompt);
-      const response = await result.response;
-      const questionsText = response.text();
-
-      const questions = questionsText
-        .split('\n')
-        .filter(line => line.trim().length > 0)
-        .map(line => line.replace(/^\d+\.?\s*/, '').trim())
-        .filter(q => q.length > 10)
-        .slice(0, count);
-
-      return {
-        questions,
-        documentId,
-        chunkCount: searchResults.matches.length
-      };
-    } catch (error) {
-      logger.error('Error generating related questions:', error);
-      return {
-        questions: [],
-        documentId,
-        error: error.message
-      };
-    }
+  isAvailable() {
+    return this.initialized && this.model && embeddingService.isAvailable() && pineconeService.isAvailable();
   }
 
-  /**
-   * Health check
-   */
-  async healthCheck() {
-    const health = {
-      ragService: false,
-      gemini: false,
-      embedding: false,
-      pinecone: false,
-      initialized: this.initialized
+  getStatus() {
+    return {
+      ragService: this.initialized && !!this.model,
+      embeddingService: embeddingService.isAvailable(),
+      pineconeService: pineconeService.isAvailable(),
+      availableProviders: embeddingService.getAvailableProviders()
     };
-
-    try {
-      // Check Gemini
-      if (this.gemini) {
-        const model = this.gemini.getGenerativeModel({ model: this.defaultModel });
-        const result = await model.generateContent('Hello');
-        await result.response;
-        health.gemini = true;
-      }
-
-      // Check embedding service
-      const embeddingHealth = await embeddingService.healthCheck();
-      health.embedding = embeddingHealth.gemini || embeddingHealth.openai;
-
-      // Check Pinecone
-      const pineconeHealth = await pineconeService.healthCheck();
-      health.pinecone = pineconeHealth.status === 'healthy';
-
-      health.ragService = health.gemini && health.embedding && health.pinecone;
-
-      return health;
-    } catch (error) {
-      logger.error('RAG service health check failed:', error);
-      return {
-        ...health,
-        error: error.message
-      };
-    }
   }
 }
 
-export default new RAGService();
+const ragService = new RAGService();
+
+export default ragService;

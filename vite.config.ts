@@ -8,7 +8,7 @@ export default defineConfig({
     host: "::",
     port: 8080,
     fs: {
-      allow: ["./client"],
+      allow: ["./", "./client"],
     },
   },
   build: {
